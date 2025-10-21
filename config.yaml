@@ -5,17 +5,17 @@ notificaciones:
   email_origen: "conabinotificaciones@gmail.com"
   app_password: "jzctkhlbxtmchlig"
   email_destinos:
-    - "eduardodanielperezruiz@gmail.com"
     - "edua56621636@gmail.com"
 
 cuentas:
   - nombre: "Eduardo Pérez"
     identificador: "ESP326CU6B42408511646445"
     año_nacimiento: "2005"
-    email_notif: "eduardodanielperezruiz@gmail.com"
+    email_notif: "edua56621636@gmail.com"
 
   - nombre: "Lucía Soler"
     identificador: "ESP326CUDB42108243467929"
     año_nacimiento: "2006"
     email_notif: "edua56621636@gmail.com"
+
 
