@@ -434,8 +434,8 @@ class BotVisado:
         intervalo_horas = self.config.get('intervalo_horas', 0.5)
         intervalo_segundos = intervalo_horas * 3600
         schedule.every(intervalo_segundos).seconds.do(self.ejecutar_monitoreo)
-        schedule.every(12).hours.do(self.enviar_resumen_12h)
-        self.logger.info(f"Monitoreo para {len(self.cuentas)} cuentas cada {intervalo_segundos/60:.1f} minutos. Resumen cada 12 horas.")
+        schedule.every(1).hours.do(self.enviar_resumen_12h)
+        self.logger.info(f"Monitoreo para {len(self.cuentas)} cuentas cada {intervalo_segundos/60:.1f} minutos. Resumen cada hora.")
         self.ejecutar_monitoreo()
         while True:
             schedule.run_pending()
@@ -460,4 +460,5 @@ if __name__ == "__main__":
         bot.logger.error(f"Error fatal: {e}")
     finally:
         bot.cerrar()
+
 
