@@ -1,10 +1,5 @@
 # bot_visado.py
-# Versión final: paralela (Modo A) + resumen HTML oscuro cada 12 horas.
-# Muestra el NOMBRE de la cuenta en logs, correos y resúmenes (si existe en config),
-# manteniendo el identificador para uso interno (consultas y archivos).
-#
-# Requisitos: selenium, pillow, pytesseract, schedule, pyyaml
-# Asegúrate de tener chromedriver compatible en PATH o que webdriver.Chrome() funcione en tu sistema.
+# Versión con PostgreSQL para persistencia permanente en Railway
 
 from selenium import webdriver
 from selenium.webdriver.common.by import By
@@ -17,7 +12,6 @@ import time
 import schedule
 import logging
 import yaml
-import json
 import os
 import smtplib
 from email.mime.text import MIMEText
@@ -27,10 +21,17 @@ import base64
 from threading import Thread
 from datetime import datetime, timedelta
 
+# Importar el nuevo gestor de base de datos
+from database import DatabaseManager
+
 class BotVisado:
     def __init__(self, config_path="config.yaml"):
         self.config = self.cargar_config(config_path)
         self.setup_logging()
+        
+        # Inicializar base de datos PostgreSQL
+        self.db = DatabaseManager()
+        
         # Cargar lista de cuentas
         self.cuentas = self.config.get('cuentas', [])
         if not self.cuentas:
@@ -230,63 +231,39 @@ class BotVisado:
             self._log('error', identificador, f"Error inesperado al extraer estado: {e}")
             return None
 
-    # --- Archivos por cuenta (estado / historial) ---
-    def _get_estado_file(self, identificador):
-        return f"estado_tramite_{identificador}.json"
-
-    def _get_historial_file(self, identificador):
-        return f"historial_verificaciones_{identificador}.json"
-
+    # --- PERSISTENCIA EN POSTGRESQL (REEMPLAZA ARCHIVOS JSON) ---
     def guardar_estado(self, identificador, estado):
-        estado_file = self._get_estado_file(identificador)
-        with open(estado_file, 'w', encoding='utf-8') as f:
-            json.dump({"ultimo_estado": estado, "timestamp": time.time()}, f, ensure_ascii=False, indent=4)
-        self._log('info', identificador, f"Estado guardado en {estado_file}: {estado}")
+        """Guardar estado en PostgreSQL"""
+        success = self.db.guardar_estado(identificador, estado)
+        if success:
+            self._log('info', identificador, f"Estado guardado en DB: {estado}")
+        else:
+            self._log('error', identificador, "Error guardando estado en DB")
+        return success
 
     def cargar_estado_anterior(self, identificador):
-        estado_file = self._get_estado_file(identificador)
-        estado_anterior = None
-        if os.path.exists(estado_file):
-            try:
-                with open(estado_file, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                    estado_anterior = data.get("ultimo_estado")
-                    self._log('info', identificador, f"Estado anterior cargado: {estado_anterior}")
-            except (json.JSONDecodeError, KeyError) as e:
-                self._log('error', identificador, f"Error al cargar estado anterior: {e}")
+        """Cargar estado anterior desde PostgreSQL"""
+        estado = self.db.cargar_estado_anterior(identificador)
+        if estado:
+            self._log('info', identificador, f"Estado anterior cargado desde DB: {estado}")
         else:
-            self._log('info', identificador, "Archivo de estado anterior no encontrado.")
-        return estado_anterior
+            self._log('info', identificador, "No se encontró estado anterior en DB")
+        return estado
 
     def cargar_historial(self, identificador):
-        historial_file = self._get_historial_file(identificador)
-        historial = []
-        if os.path.exists(historial_file):
-            try:
-                with open(historial_file, 'r', encoding='utf-8') as f:
-                    historial = json.load(f)
-                    self._log('info', identificador, f"Historial cargado. Total entradas: {len(historial)}")
-            except (json.JSONDecodeError, KeyError) as e:
-                self._log('error', identificador, f"Error al cargar historial: {e}")
-        else:
-            self._log('info', identificador, "Archivo de historial no encontrado.")
+        """Cargar historial desde PostgreSQL"""
+        historial = self.db.cargar_historial(identificador)
+        self._log('info', identificador, f"Historial cargado desde DB. Total entradas: {len(historial)}")
         return historial
 
-    def guardar_historial(self, identificador, historial):
-        historial_file = self._get_historial_file(identificador)
-        with open(historial_file, 'w', encoding='utf-8') as f:
-            json.dump(historial, f, ensure_ascii=False, indent=4)
-        self._log('info', identificador, f"Historial guardado en {historial_file}. Total entradas: {len(historial)}")
-
     def registrar_verificacion(self, identificador, estado, exitoso=True):
-        historial = self.cargar_historial(identificador)
-        entrada = {
-            "fecha_hora": time.strftime('%Y-%m-%d %H:%M:%S'),
-            "estado": estado,
-            "exitoso": exitoso
-        }
-        historial.append(entrada)
-        self.guardar_historial(identificador, historial)
+        """Registrar verificación en PostgreSQL"""
+        success = self.db.registrar_verificacion(identificador, estado, exitoso)
+        if success:
+            self._log('info', identificador, f"Verificación registrada en DB: {estado} (exitoso: {exitoso})")
+        else:
+            self._log('error', identificador, "Error registrando verificación en DB")
+        return success
 
     # --- Notificaciones por cuenta ---
     def _get_email_destino(self, identificador):
@@ -520,52 +497,55 @@ Enlace: https://sutramiteconsular.maec.es/
 
     def enviar_resumen_12h(self):
         """
-        Lee los historiales por cuenta, filtra las entradas de las últimas 12 horas,
+        Lee los historiales por cuenta desde PostgreSQL, filtra las entradas de las últimas 12 horas,
         genera un HTML con tema oscuro y lo envía al email configurado.
         """
         try:
             now = datetime.now()
             cutoff = now - timedelta(hours=12)
+            cutoff_str = cutoff.strftime('%Y-%m-%d %H:%M:%S')
+            
             tabla_rows = []
             total_monitoreos = 0
             total_errores = 0
             cuentas_incluidas = 0
-            ultimo_ciclo = time.strftime('%Y-%m-%d %H:%M:%S')
 
             for cuenta in self.cuentas:
                 identificador = cuenta.get('identificador')
                 nombre = cuenta.get('nombre', identificador)
+                
+                # Cargar historial desde PostgreSQL
                 historial = self.cargar_historial(identificador)
-                # Filtrar entradas en las últimas 12 horas
+                
+                # Filtrar entradas recientes
                 recientes = []
                 for entrada in historial:
                     fh = entrada.get('fecha_hora')
                     if not fh:
                         continue
                     try:
-                        dt = datetime.strptime(fh, '%Y-%m-%d %H:%M:%S')
+                        # Comparación directa de strings (formato YYYY-MM-DD HH:MM:SS)
+                        if fh >= cutoff_str:
+                            recientes.append(entrada)
                     except Exception:
-                        # si el formato varía, ignoramos esa entrada
                         continue
-                    if dt >= cutoff:
-                        recientes.append({"datetime": dt, "estado": entrada.get('estado'), "exitoso": entrada.get('exitoso', False)})
+                
                 if not recientes:
                     continue
+                    
                 cuentas_incluidas += 1
-                # Ordenar por datetime asc
-                recientes = sorted(recientes, key=lambda x: x['datetime'])
                 for r in recientes:
-                    hora = r['datetime'].strftime('%Y-%m-%d %H:%M:%S')
-                    estado = (r['estado'] or "").replace('\n',' ').strip()
+                    hora = r.get('fecha_hora', '')
+                    estado = (r.get('estado') or "").replace('\n',' ').strip()
                     exitoso = r.get('exitoso', False)
                     resultado_html = f"<span class='ok'>OK</span>" if exitoso else f"<span class='err'>ERROR</span>"
                     if not exitoso:
                         total_errores += 1
-                    # Mostrar nombre (sin identificador) tal como pediste
+                    
                     tabla_rows.append(f"<tr><td>{hora}</td><td>{nombre}</td><td>{estado}</td><td>{resultado_html}</td></tr>")
                     total_monitoreos += 1
 
-            resumen_texto = f"Resumen desde {cutoff.strftime('%Y-%m-%d %H:%M:%S')} hasta {now.strftime('%Y-%m-%d %H:%M:%S')}. Cuentas con actividad: {cuentas_incluidas}."
+            resumen_texto = f"Resumen desde {cutoff_str} hasta {now.strftime('%Y-%m-%d %H:%M:%S')}. Cuentas con actividad: {cuentas_incluidas}."
             resumen_global = {
                 "resumen_texto": resumen_texto,
                 "tabla_rows": "\n".join(tabla_rows) if tabla_rows else "<tr><td colspan='4' style='color:#9fb3d6;padding:12px;'>No se registraron monitoreos en las últimas 12 horas.</td></tr>",
@@ -574,14 +554,14 @@ Enlace: https://sutramiteconsular.maec.es/
                     "monitoreos": total_monitoreos,
                     "errores": total_errores
                 },
-                "ultimo_ciclo": ultimo_ciclo
+                "ultimo_ciclo": time.strftime('%Y-%m-%d %H:%M:%S')
             }
 
             html = self.generar_html_resumen_12h(resumen_global)
             asunto = f"[BOT Visado] Resumen de Monitoreo (Últimas 12h) - {time.strftime('%Y-%m-%d %H:%M:%S')}"
-            # Usamos enviar_notificacion enviando a la cuenta general (identificador_destino="__RESUMEN__")
             self.enviar_notificacion(asunto, html, identificador_destino="__RESUMEN__", es_html=True)
-            self.logger.info("Resumen 12h generado y enviado.")
+            self.logger.info("Resumen 12h generado y enviado desde PostgreSQL.")
+            
         except Exception as e:
             self.logger.error(f"Error generando/enviando resumen 12h: {e}")
 
@@ -619,8 +599,10 @@ Enlace: https://sutramiteconsular.maec.es/
 
     # Método de cierre general (por compatibilidad)
     def cerrar(self):
-        # Nota: en este diseño los drivers se cierran por hilo (finally), así que aquí no hay driver global que cerrar.
-        self.logger.info("Bot finalizado (no hay drivers globales que cerrar).")
+        # Cerrar conexión a la base de datos
+        if hasattr(self, 'db'):
+            self.db.close()
+        self.logger.info("Bot finalizado. Conexión DB cerrada.")
 
 if __name__ == "__main__":
     bot = BotVisado()
