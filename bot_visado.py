@@ -1,5 +1,5 @@
 # bot_visado.py
-# Versión con PostgreSQL para persistencia permanente en Railway
+# Versión con PostgreSQL + Resend para persistencia permanente y emails
 
 from selenium import webdriver
 from selenium.webdriver.common.by import By
@@ -13,15 +13,14 @@ import schedule
 import logging
 import yaml
 import os
-import smtplib
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
 import tempfile
 import base64
 from threading import Thread
 from datetime import datetime, timedelta
+import requests
+import json
 
-# Importar el nuevo gestor de base de datos
+# Importar el gestor de base de datos
 from database import DatabaseManager
 
 class BotVisado:
@@ -37,7 +36,6 @@ class BotVisado:
         if not self.cuentas:
             raise ValueError("No se encontraron cuentas en la configuración.")
         self.logger.info(f"Cuentas configuradas para monitoreo: {len(self.cuentas)}")
-        # Nota: NO usamos self.driver global en esta versión; cada hilo crea su propio driver.
 
     def cargar_config(self, path):
         with open(path, 'r', encoding='utf-8') as f:
@@ -231,7 +229,7 @@ class BotVisado:
             self._log('error', identificador, f"Error inesperado al extraer estado: {e}")
             return None
 
-    # --- PERSISTENCIA EN POSTGRESQL (REEMPLAZA ARCHIVOS JSON) ---
+    # --- PERSISTENCIA EN POSTGRESQL ---
     def guardar_estado(self, identificador, estado):
         """Guardar estado en PostgreSQL"""
         success = self.db.guardar_estado(identificador, estado)
@@ -265,7 +263,7 @@ class BotVisado:
             self._log('error', identificador, "Error registrando verificación en DB")
         return success
 
-    # --- Notificaciones por cuenta ---
+    # --- NOTIFICACIONES CON RESEND ---
     def _get_email_destino(self, identificador):
         for cuenta in self.cuentas:
             if cuenta.get('identificador') == identificador:
@@ -274,10 +272,7 @@ class BotVisado:
 
     def enviar_notificacion(self, asunto, cuerpo, identificador_destino, es_html=False):
         """
-        Envía una notificación. Si identificador_destino no corresponde a cuenta, se usa email_destino general.
-        identificador_destino puede ser:
-         - el identificador real de una cuenta -> se buscará su email y nombre para subject/log
-         - "__RESUMEN__" -> se enviará al email_destino general (config.notificaciones.email_destino)
+        Envía notificación usando Resend API.
         """
         # Determinar email destino
         if identificador_destino == "__RESUMEN__":
@@ -288,41 +283,74 @@ class BotVisado:
             display = self._display_name(identificador_destino)
 
         if not email_destino:
-            # Registrar error usando identificador_destino (si existe) o 'general'
-            self._log('error', identificador_destino if identificador_destino != "__RESUMEN__" else "", f"No se encontró correo destino. No se envía notificación.")
+            self._log('error', identificador_destino if identificador_destino != "__RESUMEN__" else "", 
+                     "No se encontró correo destino.")
             return
+
         try:
-            # Ajustar asunto para mostrar el nombre (si corresponde) en lugar del identificador
+            # Obtener API Key de Resend
+            resend_api_key = os.environ.get('RESEND_API_KEY')
+            
+            if not resend_api_key:
+                self._log('warning', identificador_destino, "RESEND_API_KEY no encontrada. Email no enviado.")
+                self._log_simulado(asunto, cuerpo, identificador_destino, display)
+                return
+
+            # Configurar el email
             if identificador_destino != "__RESUMEN__":
-                asunto = f"[BOT Visado] {self._display_name(identificador_destino)} - {asunto}"
-            msg = MIMEMultipart('alternative' if es_html else 'mixed')
-            msg['From'] = self.config['notificaciones']['email_origen']
-            msg['To'] = email_destino
-            msg['Subject'] = asunto
-
-            if es_html:
-                parte_html = MIMEText(cuerpo, 'html', 'utf-8')
-                msg.attach(parte_html)
+                asunto_completo = f"[BOT Visado] {display} - {asunto}"
             else:
-                parte_texto = MIMEText(cuerpo, 'plain', 'utf-8')
-                msg.attach(parte_texto)
+                asunto_completo = asunto
 
-            server = smtplib.SMTP('smtp.gmail.com', 587)
-            server.starttls()
-            server.login(self.config['notificaciones']['email_origen'], self.config['notificaciones']['app_password'])
-            text = msg.as_string()
-            server.sendmail(self.config['notificaciones']['email_origen'], email_destino, text)
-            server.quit()
-            # Log con nombre de la cuenta (si aplica)
-            if identificador_destino == "__RESUMEN__":
-                self.logger.info(f"(RESUMEN) Notificación enviada a {email_destino}: {asunto}")
+            # Enviar email usando Resend API
+            response = requests.post(
+                "https://api.resend.com/emails",
+                headers={
+                    "Authorization": f"Bearer {resend_api_key}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "from": "BOT Visado <onboarding@resend.dev>",
+                    "to": [email_destino],
+                    "subject": asunto_completo,
+                    "html": cuerpo if es_html else f"<pre style='font-family: Arial, sans-serif; white-space: pre-wrap;'>{cuerpo}</pre>"
+                },
+                timeout=30
+            )
+
+            # Verificar respuesta
+            if response.status_code == 200:
+                result = response.json()
+                if identificador_destino == "__RESUMEN__":
+                    self.logger.info(f"✅ (RESUMEN) Email enviado vía Resend a {email_destino}")
+                else:
+                    self._log('info', identificador_destino, f"✅ Email enviado vía Resend a {email_destino}")
             else:
-                self._log('info', identificador_destino, f"Notificación enviada a {email_destino}: {asunto}")
+                error_info = response.json()
+                raise Exception(f"Resend API error: {response.status_code} - {error_info}")
+
         except Exception as e:
             if identificador_destino == "__RESUMEN__":
-                self.logger.error(f"(RESUMEN) Error al enviar notificación: {e}")
+                self.logger.error(f"❌ (RESUMEN) Error enviando email: {e}")
             else:
-                self._log('error', identificador_destino, f"Error al enviar notificación: {e}")
+                self._log('error', identificador_destino, f"Error enviando email: {e}")
+            
+            # Fallback: log simulado
+            self._log_simulado(asunto, cuerpo, identificador_destino, display)
+
+    def _log_simulado(self, asunto, cuerpo, identificador_destino, display):
+        """Log cuando no se puede enviar email"""
+        if identificador_destino == "__RESUMEN__":
+            self.logger.info(f"📧 (SIMULADO RESUMEN) {asunto}")
+            # Guardar resumen en un archivo temporal para debugging
+            try:
+                with open("resumen_simulado.html", "w", encoding="utf-8") as f:
+                    f.write(cuerpo)
+                self.logger.info("📄 Resumen guardado en resumen_simulado.html")
+            except:
+                pass
+        else:
+            self._log('info', identificador_destino, f"📧 (SIMULADO) {asunto}")
 
     # --- Consulta por cuenta usando driver local ---
     def consultar_estado_para_cuenta(self, driver, wait, identificador, ano_nacimiento):
@@ -406,7 +434,7 @@ class BotVisado:
                     # Construir asunto/cuerpo con NOMBRE visible
                     display_name = self._display_name(identificador)
                     if es_primera_vez:
-                        asunto = f"[BOT Visado] 🎉 Estado Inicial para {display_name}"
+                        asunto = f"🎉 Estado Inicial para {display_name}"
                         cuerpo = f"""
 ¡Hola! Este es el estado inicial de tu trámite para {display_name}.
 Estado: {estado_actual}
@@ -415,7 +443,7 @@ Enlace: https://sutramiteconsular.maec.es/
 El bot seguirá monitoreando.
 """
                     else:
-                        asunto = f"[BOT Visado] 🚨 Cambio de Estado para {display_name}: {estado_actual}"
+                        asunto = f"🚨 Cambio de Estado para {display_name}: {estado_actual}"
                         cuerpo = f"""
 El estado de tu trámite para {display_name} ha cambiado.
 Nuevo Estado: {estado_actual}
@@ -558,7 +586,7 @@ Enlace: https://sutramiteconsular.maec.es/
             }
 
             html = self.generar_html_resumen_12h(resumen_global)
-            asunto = f"[BOT Visado] Resumen de Monitoreo (Últimas 12h) - {time.strftime('%Y-%m-%d %H:%M:%S')}"
+            asunto = f"Resumen de Monitoreo (Últimas 12h) - {time.strftime('%Y-%m-%d %H:%M:%S')}"
             self.enviar_notificacion(asunto, html, identificador_destino="__RESUMEN__", es_html=True)
             self.logger.info("Resumen 12h generado y enviado desde PostgreSQL.")
             
@@ -615,3 +643,4 @@ if __name__ == "__main__":
         bot.logger.error(f"Error fatal: {e}")
     finally:
         bot.cerrar()
+
