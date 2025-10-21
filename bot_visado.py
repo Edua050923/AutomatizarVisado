@@ -284,14 +284,21 @@ class BotVisado:
             self._log('error', identificador, "Error registrando verificación en DB")
         return success
 
-    # --- NOTIFICACIONES CON RESEND (Sin cambios) ---
+    # --- NOTIFICACIONES CON RESEND ---
     def _get_email_destino(self, identificador):
+        """
+        Obtiene el email específico de la cuenta o el primer email de la lista global
+        como fallback. (Limpieza de código)
+        """
+        # Obtener el email por defecto (el primero de la lista)
+        default_email = self.config['notificaciones'].get('email_destinos', [None])[0] 
+        
         for cuenta in self.cuentas:
             if cuenta.get('identificador') == identificador:
                 # Se utiliza el campo 'email_notif' si existe
-                return cuenta.get('email_notif', self.config['notificaciones'].get('email_destinos')[0]) 
-        # Si no se encuentra, se utiliza el primer email de la lista global
-        return self.config['notificaciones'].get('email_destinos')[0] 
+                return cuenta.get('email_notif', default_email) 
+        # Si no se encuentra, se utiliza el email por defecto
+        return default_email
 
     def enviar_notificacion(self, asunto, cuerpo, identificador_destino, es_html=False):
         """
@@ -300,7 +307,7 @@ class BotVisado:
         # Determinar email destino
         if identificador_destino == "__RESUMEN__":
             # Envía al primer email de la lista de destinos para el resumen
-            email_destino = self.config['notificaciones'].get('email_destinos')[0]
+            email_destino = self.config['notificaciones'].get('email_destinos', [None])[0]
             display = "Resumen"
         else:
             email_destino = self._get_email_destino(identificador_destino)
@@ -384,8 +391,8 @@ class BotVisado:
         while intentos < max_reintentos_captcha:
             self._log('info', identificador, f"Intento {intentos + 1} de {max_reintentos_captcha}")
             try:
-                driver.get("https://sutramiteconsular.maec.es/  ")
-                # Aumentar la pausa inicial para la carga estable de la página
+                # CORRECCIÓN: Eliminar doble espacio y AUMENTAR PAUSA para carga estable
+                driver.get("https://sutramiteconsular.maec.es/") 
                 time.sleep(3) 
 
                 captcha_path = self.capturar_captcha(driver, wait, identificador)
@@ -437,7 +444,7 @@ class BotVisado:
         self._log('error', identificador, "Consulta fallida tras todos los reintentos.")
         return None
 
-    # --- Worker, Resumen y Ejecución (Sin cambios) ---
+    # --- Worker por cuenta (usado por cada hilo) ---
     def worker_cuenta(self, cuenta):
         identificador = cuenta.get('identificador')
         nombre = cuenta.get('nombre', identificador)
@@ -490,6 +497,7 @@ Enlace: https://sutramiteconsular.maec.es/
             except Exception as e:
                 self._log('warning', identificador, f"Error cerrando driver: {e}")
 
+    # --- Resumen 12 horas (HTML oscuro) ---
     def generar_html_resumen_12h(self, resumen_global):
         """
         Genera un HTML con tema oscuro (estético) que presenta el resumen por cuenta.
@@ -519,7 +527,7 @@ Enlace: https://sutramiteconsular.maec.es/
               <div class="meta">{resumen_global.get('resumen_texto','')}</div>
             </div>
             <div class="small">
-              <div><strong>Cuentas:</strong> {resumen_global['totals'].get('cuentas',0)}</div>
+              <div><strong>Cuentas:</strong> {len(self.cuentas)}</div>
               <div><strong>Monitoreos:</strong> {resumen_global['totals'].get('monitoreos',0)}</div>
               <div><strong>Errores:</strong> {resumen_global['totals'].get('errores',0)}</div>
               <div style="margin-top:8px; font-size:12px; color:#bcd3f8;">Último ciclo: {resumen_global.get('ultimo_ciclo','-')}</div>
@@ -617,6 +625,7 @@ Enlace: https://sutramiteconsular.maec.es/
         except Exception as e:
             self.logger.error(f"Error generando/enviando resumen 12h: {e}")
 
+    # --- Ejecución del monitoreo (paralelo por ciclo) ---
     def ejecutar_monitoreo(self):
         self.logger.info("Iniciando ciclo de monitoreo (paralelo) para múltiples cuentas.")
         hilos = []
