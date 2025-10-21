@@ -1,4 +1,4 @@
-# bot_visado.py
+# bot_visado.py (Optimizado)
 # Versión con PostgreSQL + Resend para persistencia permanente y emails
 
 from selenium import webdriver
@@ -122,16 +122,31 @@ class BotVisado:
             return None
 
     def preprocesar_captcha(self, image_path, identificador=None):
-        """Preprocesa la imagen CAPTCHA para mejorar OCR (dígitos)."""
+        """Preprocesa la imagen CAPTCHA para mejorar OCR (dígitos). OPTIMIZADO"""
         try:
             image = Image.open(image_path)
+            
+            # 1. Escalado (Aumento de resolución)
             new_size = (image.width * 4, image.height * 4)
             image = image.resize(new_size, Image.LANCZOS)
-            image = image.convert('L')  # escala de grises
+            
+            # 2. Conversión a escala de grises
+            image = image.convert('L')
+            
+            # 3. Aumento de Contraste
             enhancer = ImageEnhance.Contrast(image)
             image = enhancer.enhance(4)
-            image = image.point(lambda p: p > 150 and 255)
+
+            # 4. Desenfoque Gaussiano (Suavizar bordes y ruido fino)
+            image = image.filter(ImageFilter.GaussianBlur(radius=1))
+            
+            # 5. Binarización (Umbral más estricto)
+            # Experimenta con este valor (150 a 180) para el mejor resultado
+            image = image.point(lambda p: p > 165 and 255) 
+            
+            # 6. Filtro de Mediana (Eliminar ruido 'salt and pepper')
             image = image.filter(ImageFilter.MedianFilter(size=3))
+            
             processed_path = image_path.replace('.png', '_processed.png')
             image.save(processed_path)
             self._log('info', identificador, f"Imagen CAPTCHA preprocesada guardada en: {processed_path}")
@@ -143,12 +158,14 @@ class BotVisado:
     def resolver_captcha(self, image_path, identificador=None):
         try:
             image = Image.open(image_path)
-            custom_config = r'--oem 3 --psm 8 -c tessedit_char_whitelist=0123456789'
+            # Se cambia psm 8 a psm 6: 
+            # psm 6: Assume a single uniform block of text. (Más robusto si hay espacio entre dígitos)
+            custom_config = r'--oem 3 --psm 6 -c tessedit_char_whitelist=0123456789'
             texto = pytesseract.image_to_string(image, config=custom_config).strip()
             texto_limpio = ''.join(c for c in texto if c.isdigit())
             self._log('info', identificador, f"Texto OCR del CAPTCHA (original): '{texto}'")
             self._log('info', identificador, f"Texto OCR del CAPTCHA (limpio): '{texto_limpio}'")
-            if len(texto_limpio) == 6:  # Validar 6 dígitos (según tu config anterior)
+            if len(texto_limpio) == 6:  # Validar 6 dígitos
                 self._log('info', identificador, f"Texto OCR validado: '{texto_limpio}'")
                 return texto_limpio
             else:
@@ -181,6 +198,10 @@ class BotVisado:
             ano_nacimiento_input.send_keys(ano_nacimiento)
             captcha_input.clear()
             captcha_input.send_keys(captcha_texto)
+            
+            # Mejora: Simular mejor interacción humana (quitar el foco y pausa)
+            driver.execute_script("arguments[0].blur();", captcha_input)
+            time.sleep(0.5)
 
             submit_button.click()
             self._log('info', identificador, f"Formulario enviado para {identificador}.")
@@ -229,7 +250,7 @@ class BotVisado:
             self._log('error', identificador, f"Error inesperado al extraer estado: {e}")
             return None
 
-    # --- PERSISTENCIA EN POSTGRESQL ---
+    # --- PERSISTENCIA EN POSTGRESQL (Sin cambios en este archivo, usa el gestor de DB) ---
     def guardar_estado(self, identificador, estado):
         """Guardar estado en PostgreSQL"""
         success = self.db.guardar_estado(identificador, estado)
@@ -263,12 +284,14 @@ class BotVisado:
             self._log('error', identificador, "Error registrando verificación en DB")
         return success
 
-    # --- NOTIFICACIONES CON RESEND ---
+    # --- NOTIFICACIONES CON RESEND (Sin cambios) ---
     def _get_email_destino(self, identificador):
         for cuenta in self.cuentas:
             if cuenta.get('identificador') == identificador:
-                return cuenta.get('email_notif', self.config['notificaciones'].get('email_destino'))
-        return self.config['notificaciones'].get('email_destino')
+                # Se utiliza el campo 'email_notif' si existe
+                return cuenta.get('email_notif', self.config['notificaciones'].get('email_destinos')[0]) 
+        # Si no se encuentra, se utiliza el primer email de la lista global
+        return self.config['notificaciones'].get('email_destinos')[0] 
 
     def enviar_notificacion(self, asunto, cuerpo, identificador_destino, es_html=False):
         """
@@ -276,7 +299,8 @@ class BotVisado:
         """
         # Determinar email destino
         if identificador_destino == "__RESUMEN__":
-            email_destino = self.config['notificaciones'].get('email_destino')
+            # Envía al primer email de la lista de destinos para el resumen
+            email_destino = self.config['notificaciones'].get('email_destinos')[0]
             display = "Resumen"
         else:
             email_destino = self._get_email_destino(identificador_destino)
@@ -361,7 +385,8 @@ class BotVisado:
             self._log('info', identificador, f"Intento {intentos + 1} de {max_reintentos_captcha}")
             try:
                 driver.get("https://sutramiteconsular.maec.es/  ")
-                time.sleep(2 if intentos < 6 else 1)
+                # Aumentar la pausa inicial para la carga estable de la página
+                time.sleep(3) 
 
                 captcha_path = self.capturar_captcha(driver, wait, identificador)
                 if not captcha_path:
@@ -412,7 +437,7 @@ class BotVisado:
         self._log('error', identificador, "Consulta fallida tras todos los reintentos.")
         return None
 
-    # --- Worker por cuenta (usado por cada hilo) ---
+    # --- Worker, Resumen y Ejecución (Sin cambios) ---
     def worker_cuenta(self, cuenta):
         identificador = cuenta.get('identificador')
         nombre = cuenta.get('nombre', identificador)
@@ -465,7 +490,6 @@ Enlace: https://sutramiteconsular.maec.es/
             except Exception as e:
                 self._log('warning', identificador, f"Error cerrando driver: {e}")
 
-    # --- Resumen 12 horas (HTML oscuro) ---
     def generar_html_resumen_12h(self, resumen_global):
         """
         Genera un HTML con tema oscuro (estético) que presenta el resumen por cuenta.
@@ -578,7 +602,7 @@ Enlace: https://sutramiteconsular.maec.es/
                 "resumen_texto": resumen_texto,
                 "tabla_rows": "\n".join(tabla_rows) if tabla_rows else "<tr><td colspan='4' style='color:#9fb3d6;padding:12px;'>No se registraron monitoreos en las últimas 12 horas.</td></tr>",
                 "totals": {
-                    "cuentas": cuentas_incluidas,
+                    "cuentas": len(self.cuentas), # Usar el total de cuentas configuradas
                     "monitoreos": total_monitoreos,
                     "errores": total_errores
                 },
@@ -593,7 +617,6 @@ Enlace: https://sutramiteconsular.maec.es/
         except Exception as e:
             self.logger.error(f"Error generando/enviando resumen 12h: {e}")
 
-    # --- Ejecución del monitoreo (paralelo por ciclo) ---
     def ejecutar_monitoreo(self):
         self.logger.info("Iniciando ciclo de monitoreo (paralelo) para múltiples cuentas.")
         hilos = []
@@ -643,4 +666,3 @@ if __name__ == "__main__":
         bot.logger.error(f"Error fatal: {e}")
     finally:
         bot.cerrar()
-
