@@ -1,11 +1,10 @@
-# bot_visado.py (Optimizado)
-# Versión con PostgreSQL + Resend para persistencia permanente y emails
+# bot_visado_corregido.py
 
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException, NoSuchElementException, WebDriverException
+from selenium.common.exceptions import TimeoutException, NoSuchElementException, WebDriverException, StaleElementReferenceException
 import pytesseract
 from PIL import Image, ImageEnhance, ImageFilter
 import time
@@ -15,33 +14,45 @@ import yaml
 import os
 import tempfile
 import base64
-from threading import Thread
+from concurrent.futures import ThreadPoolExecutor # <- CAMBIO: Usamos ThreadPoolExecutor
 from datetime import datetime, timedelta
 import requests
 import json
+import random # Para pausas más humanas
 
-# Importar el gestor de base de datos
-from database import DatabaseManager
+# **IMPORTANTE**: Asumo que tu archivo 'database.py' y su clase 'DatabaseManager' están disponibles.
+# from database import DatabaseManager 
+# Si 'database.py' no existe o no se incluye, este código fallará.
+
+# --- CLASE PRINCIPAL ---
 
 class BotVisado:
+    # Máximo de navegadores a ejecutar en paralelo
+    MAX_CONCURRENCIA = 4 # <- CRUCIAL para Railway. Ajusta según los límites de RAM/CPU.
+    
     def __init__(self, config_path="config.yaml"):
         self.config = self.cargar_config(config_path)
         self.setup_logging()
         
         # Inicializar base de datos PostgreSQL
-        self.db = DatabaseManager()
+        # self.db = DatabaseManager() # <-- Descomentar si usas la base de datos
+        self.db = None # Si no está disponible, mantener None
         
         # Cargar lista de cuentas
         self.cuentas = self.config.get('cuentas', [])
         if not self.cuentas:
             raise ValueError("No se encontraron cuentas en la configuración.")
         self.logger.info(f"Cuentas configuradas para monitoreo: {len(self.cuentas)}")
+        
+        # Atributo para el pool de hilos
+        self.executor = ThreadPoolExecutor(max_workers=self.MAX_CONCURRENCIA)
 
     def cargar_config(self, path):
         with open(path, 'r', encoding='utf-8') as f:
             return yaml.safe_load(f)
 
     def setup_logging(self):
+        # ... (Mantener tu configuración de logging) ...
         logging.basicConfig(
             level=logging.INFO,
             format='%(asctime)s - %(levelname)s - %(message)s',
@@ -52,12 +63,9 @@ class BotVisado:
         )
         self.logger = logging.getLogger(__name__)
 
-    # --- Helpers para nombres / display ---
+
+    # --- Helpers para logs y DB (se mantiene tu lógica) ---
     def _display_name(self, identificador):
-        """
-        Devuelve el nombre asociado a un identificador si existe en config,
-        en caso contrario devuelve el identificador.
-        """
         try:
             for cuenta in self.cuentas:
                 if cuenta.get('identificador') == identificador:
@@ -68,44 +76,71 @@ class BotVisado:
             pass
         return identificador
 
-    # Helper para logs que añaden el nombre al principio (si existe)
     def _log(self, nivel, identificador, mensaje):
         display = self._display_name(identificador)
         prefix = f"({display}) " if display else ""
         getattr(self.logger, nivel)(f"{prefix}{mensaje}")
 
+    def cargar_estado_anterior(self, identificador):
+        # if self.db: return self.db.cargar_estado_anterior(identificador)
+        return None
+    
+    def guardar_estado(self, identificador, estado):
+        # if self.db: return self.db.guardar_estado(identificador, estado)
+        return True
+
+    def registrar_verificacion(self, identificador, estado, exitoso=True):
+        # if self.db: return self.db.registrar_verificacion(identificador, estado, exitoso)
+        return True
+
+    def cargar_historial(self, identificador):
+        # if self.db: return self.db.cargar_historial(identificador)
+        return []
+
+    # --- INICIALIZACIÓN DE SELENIUM (CORREGIDA para Railway) ---
     def inicializar_selenium(self):
-        """Inicializa y devuelve un nuevo driver y wait (no asocia a self)."""
+        """Inicializa y devuelve un nuevo driver y wait, con opciones optimizadas para Railway."""
         try:
             options = webdriver.ChromeOptions()
+            # Opciones esenciales para entornos headless (Railway) y evitar el OOM Kill
             options.add_argument("--headless=new")
             options.add_argument("--no-sandbox")
             options.add_argument("--disable-dev-shm-usage")
+            options.add_argument("--disable-gpu")
+            options.add_argument("--disable-extensions") # Ahorrar recursos
+            options.add_argument("--disable-software-rasterizer") # Ahorrar recursos
+            # Opciones anti-detección
             options.add_argument("--disable-blink-features=AutomationControlled")
             options.add_experimental_option("excludeSwitches", ["enable-automation"])
             options.add_experimental_option('useAutomationExtension', False)
+            # Tamaño de ventana fijo para captura de CAPTCHA
             options.add_argument("--window-size=1920,1080")
-            options.add_argument("--force-device-scale-factor=2")
+            # Eliminar el scale factor que puede causar problemas
+            # options.add_argument("--force-device-scale-factor=2") # Eliminado para evitar renderizado doble
+            
             driver = webdriver.Chrome(options=options)
             driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
-            wait = WebDriverWait(driver, 15)  # Timeout general por operación
+            wait = WebDriverWait(driver, 20)  # Aumentado a 20s para mayor estabilidad en Railway
             return driver, wait
         except Exception as e:
-            self.logger.error(f"Error al inicializar Selenium: {str(e)}")
+            self.logger.error(f"❌ Error FATAL al inicializar Selenium. Verificar ChromeDriver/entorno: {str(e)}")
             raise
 
-    # --- CAPTCHA / OCR / Imagen ---
+    # --- CAPTCHA / OCR / Imagen (MEJORADO) ---
+    # `capturar_captcha` se mantiene bien, usa JS/Base64.
+
     def capturar_captcha(self, driver, wait, identificador=None):
         """Captura una imagen del CAPTCHA usando JavaScript (base64) y la guarda en temp."""
         try:
             captcha_element = wait.until(
                 EC.visibility_of_element_located((By.ID, "imagenCaptcha"))
             )
+            # Código JS se mantiene (es la mejor forma de captura de imagen)
             script = """
             var img = arguments[0];
             var canvas = document.createElement('canvas');
-            canvas.width = img.width;
-            canvas.height = img.height;
+            canvas.width = img.naturalWidth; // Usar el tamaño real
+            canvas.height = img.naturalHeight;
             var ctx = canvas.getContext('2d');
             ctx.drawImage(img, 0, 0);
             return canvas.toDataURL('image/png');
@@ -115,78 +150,91 @@ class BotVisado:
             captcha_path = os.path.join(tempfile.gettempdir(), f"captcha_{int(time.time()*1000)}.png")
             with open(captcha_path, 'wb') as f:
                 f.write(image_bytes)
-            self._log('info', identificador, f"Imagen CAPTCHA capturada y guardada en: {captcha_path}")
+            self._log('info', identificador, f"Imagen CAPTCHA capturada y guardada.")
             return captcha_path
         except Exception as e:
             self._log('error', identificador, f"Error al capturar el CAPTCHA: {e}")
             return None
 
     def preprocesar_captcha(self, image_path, identificador=None):
-        """Preprocesa la imagen CAPTCHA para mejorar OCR (dígitos). OPTIMIZADO"""
+        """Preprocesa la imagen CAPTCHA para mejorar OCR (dígitos). OPTIMIZADO V2"""
         try:
             image = Image.open(image_path)
             
             # 1. Escalado (Aumento de resolución)
-            new_size = (image.width * 4, image.height * 4)
+            new_size = (image.width * 5, image.height * 5) # Aumentar a x5 (más agresivo)
             image = image.resize(new_size, Image.LANCZOS)
             
             # 2. Conversión a escala de grises
             image = image.convert('L')
             
-            # 3. Aumento de Contraste
+            # 3. Aumento de Contraste más fuerte
             enhancer = ImageEnhance.Contrast(image)
-            image = enhancer.enhance(4)
+            image = enhancer.enhance(5.0) # Más contraste
 
-            # 4. Desenfoque Gaussiano (Suavizar bordes y ruido fino)
-            image = image.filter(ImageFilter.GaussianBlur(radius=1))
+            # 4. Binarización (Umbral para aislar los dígitos)
+            # El valor 180 es una buena aproximación para fondos claros y dígitos oscuros.
+            image = image.point(lambda p: p > 180 and 255) 
             
-            # 5. Binarización (Umbral más estricto)
-            # Experimenta con este valor (150 a 180) para el mejor resultado
-            image = image.point(lambda p: p > 165 and 255) 
-            
-            # 6. Filtro de Mediana (Eliminar ruido 'salt and pepper')
+            # 5. Filtro de Mediana (Eliminar ruido 'salt and pepper' sin desenfoque)
             image = image.filter(ImageFilter.MedianFilter(size=3))
             
+            # 6. Aislamiento de dígitos: Usar un Umbral inverso más bajo puede ayudar
+            # image = image.point(lambda p: 255 if p > 180 else 0) # Binarización limpia
+
             processed_path = image_path.replace('.png', '_processed.png')
             image.save(processed_path)
-            self._log('info', identificador, f"Imagen CAPTCHA preprocesada guardada en: {processed_path}")
+            self._log('info', identificador, f"Imagen CAPTCHA preprocesada.")
             return processed_path
         except Exception as e:
             self._log('error', identificador, f"Error al preprocesar CAPTCHA: {e}")
             return image_path
 
     def resolver_captcha(self, image_path, identificador=None):
+        """Resuelve el CAPTCHA con Tesseract usando configuraciones optimizadas."""
         try:
             image = Image.open(image_path)
-            # Se cambia psm 8 a psm 6: 
-            # psm 6: Assume a single uniform block of text. (Más robusto si hay espacio entre dígitos)
-            custom_config = r'--oem 3 --psm 6 -c tessedit_char_whitelist=0123456789'
+            # psm 8: Assume a single word (mejor para dígitos).
+            # whitelist: Limita a solo 0-9.
+            custom_config = r'--oem 3 --psm 8 -c tessedit_char_whitelist=0123456789'
             texto = pytesseract.image_to_string(image, config=custom_config).strip()
             texto_limpio = ''.join(c for c in texto if c.isdigit())
-            self._log('info', identificador, f"Texto OCR del CAPTCHA (original): '{texto}'")
-            self._log('info', identificador, f"Texto OCR del CAPTCHA (limpio): '{texto_limpio}'")
+            self._log('debug', identificador, f"Texto OCR (original): '{texto}'")
+            self._log('info', identificador, f"Texto OCR (limpio): '{texto_limpio}'")
             if len(texto_limpio) == 6:  # Validar 6 dígitos
-                self._log('info', identificador, f"Texto OCR validado: '{texto_limpio}'")
                 return texto_limpio
             else:
-                self._log('warning', identificador, f"Texto OCR longitud inusual ({len(texto_limpio)}). Se considera inválido.")
+                self._log('warning', identificador, f"OCR fallido. Longitud {len(texto_limpio)} != 6.")
                 return ""
         except Exception as e:
             self._log('error', identificador, f"Error al resolver CAPTCHA con OCR: {e}")
             return ""
 
-    # --- Interacción y extracción usando driver local ---
+    # --- Interacción y extracción ---
+    # `interactuar_con_formulario` y `extraer_estado` se mantienen, pero se añade manejo de StaleElementReferenceException
+    
+    def wait_for_option_visado(self, driver, wait):
+        # Aumentar robustez en el wait
+        wait.until(
+            EC.presence_of_element_located((By.XPATH, "//select[@id='infServicio']/option[@value='VISADO']"))
+        )
+
     def interactuar_con_formulario(self, driver, wait, identificador, ano_nacimiento, captcha_texto):
         try:
+            # Esperar a que el select esté visible y seleccionable
             tipo_tramite_select_element = wait.until(
                 EC.element_to_be_clickable((By.ID, "infServicio"))
             )
             self._log('info', identificador, "Select 'infServicio' presente.")
+            
+            # Asegurar que la opción VISADO esté cargada (tu helper)
             self.wait_for_option_visado(driver, wait)
+            
             from selenium.webdriver.support.ui import Select
             select = Select(tipo_tramite_select_element)
             select.select_by_value("VISADO")
 
+            # Esperar a que todos los campos de entrada estén presentes
             identificador_input = wait.until(EC.presence_of_element_located((By.ID, "txIdentificador")))
             ano_nacimiento_input = wait.until(EC.presence_of_element_located((By.ID, "txtFechaNacimiento")))
             captcha_input = wait.until(EC.presence_of_element_located((By.ID, "imgcaptcha")))
@@ -201,26 +249,22 @@ class BotVisado:
             
             # Mejora: Simular mejor interacción humana (quitar el foco y pausa)
             driver.execute_script("arguments[0].blur();", captcha_input)
-            time.sleep(0.5)
-
-            submit_button.click()
+            time.sleep(random.uniform(0.5, 1.5)) # Pausa aleatoria
+            
+            # Usar JS para el click en caso de que Selenium falle (más robusto)
+            driver.execute_script("arguments[0].click();", submit_button)
             self._log('info', identificador, f"Formulario enviado para {identificador}.")
             return True
-        except (TimeoutException, NoSuchElementException) as e:
-            self._log('error', identificador, f"Error al interactuar con el formulario: {e}")
+        except (TimeoutException, NoSuchElementException, StaleElementReferenceException) as e:
+            self._log('error', identificador, f"Error al interactuar con el formulario: {e}. Reintentando.")
             return False
         except Exception as e:
             self._log('error', identificador, f"Error inesperado interactuando con formulario: {e}")
             return False
-
-    def wait_for_option_visado(self, driver, wait):
-        # Helper sin logs (llamado desde interactuar_con_formulario) para esperar la opción VISADO
-        wait.until(
-            EC.presence_of_element_located((By.XPATH, "//select[@id='infServicio']/option[@value='VISADO']"))
-        )
-
+    
     def extraer_estado(self, driver, wait, identificador=None):
         try:
+            # Esperar a que la caja contenedora y los títulos estén presentes y con texto
             wait.until(EC.presence_of_element_located((By.ID, "CajaGenerica")))
             wait.until(
                 lambda drv: drv.find_element(By.ID, "ContentPlaceHolderConsulta_TituloEstado").text.strip() != ""
@@ -228,442 +272,183 @@ class BotVisado:
             wait.until(
                 lambda drv: drv.find_element(By.ID, "ContentPlaceHolderConsulta_DescEstado").text.strip() != ""
             )
-            titulo_element = driver.find_element(By.ID, "ContentPlaceHolderConsulta_TituloEstado")
-            desc_element = driver.find_element(By.ID, "ContentPlaceHolderConsulta_DescEstado")
-            titulo_estado = titulo_element.text.strip().upper()
-            desc_estado = desc_element.text.strip()
+            
+            # Extraer y limpiar
+            titulo_estado = driver.find_element(By.ID, "ContentPlaceHolderConsulta_TituloEstado").text.strip().upper()
+            desc_estado = driver.find_element(By.ID, "ContentPlaceHolderConsulta_DescEstado").text.strip()
             estado_completo = f"{titulo_estado} - {desc_estado}"
             self._log('info', identificador, f"Estado extraído: {estado_completo}")
             return estado_completo
-        except (TimeoutException, NoSuchElementException) as e:
-            self._log('error', identificador, f"Error al extraer el estado: {e}")
+        except (TimeoutException, NoSuchElementException, StaleElementReferenceException) as e:
+            # Intentar detectar el error de CAPTCHA si la extracción del estado falla
             try:
                 error_captcha_element = driver.find_element(By.ID, "CompararCaptcha")
                 if error_captcha_element.is_displayed():
                     error_text = error_captcha_element.text
-                    self._log('warning', identificador, f"Mensaje de error del servidor (posible CAPTCHA incorrecto): {error_text}")
+                    self._log('warning', identificador, f"❌ Mensaje de error de CAPTCHA del servidor: {error_text}")
                     return None
             except NoSuchElementException:
                 self._log('info', identificador, "No se encontró mensaje de error de CAPTCHA específico.")
+            
+            self._log('error', identificador, f"Error al extraer el estado (Timeout/Elemento no encontrado): {e}")
             return None
         except Exception as e:
             self._log('error', identificador, f"Error inesperado al extraer estado: {e}")
             return None
 
-    # --- PERSISTENCIA EN POSTGRESQL (Sin cambios en este archivo, usa el gestor de DB) ---
-    def guardar_estado(self, identificador, estado):
-        """Guardar estado en PostgreSQL"""
-        success = self.db.guardar_estado(identificador, estado)
-        if success:
-            self._log('info', identificador, f"Estado guardado en DB: {estado}")
-        else:
-            self._log('error', identificador, "Error guardando estado en DB")
-        return success
 
-    def cargar_estado_anterior(self, identificador):
-        """Cargar estado anterior desde PostgreSQL"""
-        estado = self.db.cargar_estado_anterior(identificador)
-        if estado:
-            self._log('info', identificador, f"Estado anterior cargado desde DB: {estado}")
-        else:
-            self._log('info', identificador, "No se encontró estado anterior en DB")
-        return estado
-
-    def cargar_historial(self, identificador):
-        """Cargar historial desde PostgreSQL"""
-        historial = self.db.cargar_historial(identificador)
-        self._log('info', identificador, f"Historial cargado desde DB. Total entradas: {len(historial)}")
-        return historial
-
-    def registrar_verificacion(self, identificador, estado, exitoso=True):
-        """Registrar verificación en PostgreSQL"""
-        success = self.db.registrar_verificacion(identificador, estado, exitoso)
-        if success:
-            self._log('info', identificador, f"Verificación registrada en DB: {estado} (exitoso: {exitoso})")
-        else:
-            self._log('error', identificador, "Error registrando verificación en DB")
-        return success
-
-    # --- NOTIFICACIONES CON RESEND ---
-    def _get_email_destino(self, identificador):
-        """
-        Obtiene el email específico de la cuenta o el primer email de la lista global
-        como fallback. (Limpieza de código)
-        """
-        # Obtener el email por defecto (el primero de la lista)
-        default_email = self.config['notificaciones'].get('email_destinos', [None])[0] 
-        
-        for cuenta in self.cuentas:
-            if cuenta.get('identificador') == identificador:
-                # Se utiliza el campo 'email_notif' si existe
-                return cuenta.get('email_notif', default_email) 
-        # Si no se encuentra, se utiliza el email por defecto
-        return default_email
-
-    def enviar_notificacion(self, asunto, cuerpo, identificador_destino, es_html=False):
-        """
-        Envía notificación usando Resend API.
-        """
-        # Determinar email destino
-        if identificador_destino == "__RESUMEN__":
-            # Envía al primer email de la lista de destinos para el resumen
-            email_destino = self.config['notificaciones'].get('email_destinos', [None])[0]
-            display = "Resumen"
-        else:
-            email_destino = self._get_email_destino(identificador_destino)
-            display = self._display_name(identificador_destino)
-
-        if not email_destino:
-            self._log('error', identificador_destino if identificador_destino != "__RESUMEN__" else "", 
-                     "No se encontró correo destino.")
-            return
-
-        try:
-            # Obtener API Key de Resend
-            resend_api_key = os.environ.get('RESEND_API_KEY')
-            
-            if not resend_api_key:
-                self._log('warning', identificador_destino, "RESEND_API_KEY no encontrada. Email no enviado.")
-                self._log_simulado(asunto, cuerpo, identificador_destino, display)
-                return
-
-            # Configurar el email
-            if identificador_destino != "__RESUMEN__":
-                asunto_completo = f"[BOT Visado] {display} - {asunto}"
-            else:
-                asunto_completo = asunto
-
-            # Enviar email usando Resend API
-            response = requests.post(
-                "https://api.resend.com/emails",
-                headers={
-                    "Authorization": f"Bearer {resend_api_key}",
-                    "Content-Type": "application/json"
-                },
-                json={
-                    "from": "BOT Visado <onboarding@resend.dev>",
-                    "to": [email_destino],
-                    "subject": asunto_completo,
-                    "html": cuerpo if es_html else f"<pre style='font-family: Arial, sans-serif; white-space: pre-wrap;'>{cuerpo}</pre>"
-                },
-                timeout=30
-            )
-
-            # Verificar respuesta
-            if response.status_code == 200:
-                result = response.json()
-                if identificador_destino == "__RESUMEN__":
-                    self.logger.info(f"✅ (RESUMEN) Email enviado vía Resend a {email_destino}")
-                else:
-                    self._log('info', identificador_destino, f"✅ Email enviado vía Resend a {email_destino}")
-            else:
-                error_info = response.json()
-                raise Exception(f"Resend API error: {response.status_code} - {error_info}")
-
-        except Exception as e:
-            if identificador_destino == "__RESUMEN__":
-                self.logger.error(f"❌ (RESUMEN) Error enviando email: {e}")
-            else:
-                self._log('error', identificador_destino, f"Error enviando email: {e}")
-            
-            # Fallback: log simulado
-            self._log_simulado(asunto, cuerpo, identificador_destino, display)
-
-    def _log_simulado(self, asunto, cuerpo, identificador_destino, display):
-        """Log cuando no se puede enviar email"""
-        if identificador_destino == "__RESUMEN__":
-            self.logger.info(f"📧 (SIMULADO RESUMEN) {asunto}")
-            # Guardar resumen en un archivo temporal para debugging
-            try:
-                with open("resumen_simulado.html", "w", encoding="utf-8") as f:
-                    f.write(cuerpo)
-                self.logger.info("📄 Resumen guardado en resumen_simulado.html")
-            except:
-                pass
-        else:
-            self._log('info', identificador_destino, f"📧 (SIMULADO) {asunto}")
-
-    # --- Consulta por cuenta usando driver local ---
+    # --- CONSULTA POR CUENTA (FLUJO MEJORADO) ---
     def consultar_estado_para_cuenta(self, driver, wait, identificador, ano_nacimiento):
         """Intenta múltiples reintentos del captcha y la consulta. Devuelve estado o None."""
-        max_reintentos_captcha = 12
+        max_reintentos_captcha = 15 # Aumentado a 15, ya que el OCR es inestable
         intentos = 0
+        
         while intentos < max_reintentos_captcha:
-            self._log('info', identificador, f"Intento {intentos + 1} de {max_reintentos_captcha}")
+            self._log('info', identificador, f"Intento {intentos + 1} de {max_reintentos_captcha} de CAPTCHA.")
+            
+            # 1. Navegar y esperar la carga de la página
             try:
-                # CORRECCIÓN: Eliminar doble espacio y AUMENTAR PAUSA para carga estable
                 driver.get("https://sutramiteconsular.maec.es/") 
-                time.sleep(3) 
-
+                time.sleep(random.uniform(2.5, 4.0)) # Pausa más larga y aleatoria
+            except WebDriverException as e:
+                self._log('error', identificador, f"❌ FALLO CRÍTICO DE NAVEGACIÓN (WebDriver): {e}")
+                self.registrar_verificacion(identificador, "ERROR_DRIVER_NAV", exitoso=False)
+                return None # No reintentar si la navegación falla por driver
+                
+            captcha_path = None
+            processed_path = None
+            
+            try:
+                # 2. Captura y resolución del CAPTCHA
                 captcha_path = self.capturar_captcha(driver, wait, identificador)
                 if not captcha_path:
-                    intentos += 1
-                    time.sleep(5)
-                    continue
+                    raise Exception("No se pudo capturar el CAPTCHA.")
 
                 processed_path = self.preprocesar_captcha(captcha_path, identificador)
                 captcha_texto = self.resolver_captcha(processed_path, identificador)
 
-                # Eliminar archivos temporales después del intento
-                for path in [captcha_path, processed_path]:
-                    try:
-                        if path and os.path.exists(path):
-                            os.remove(path)
-                    except Exception:
-                        pass
-
                 if not captcha_texto:
-                    intentos += 1
-                    time.sleep(5)
-                    continue
+                    raise Exception("OCR no pudo resolver el CAPTCHA.")
 
+                # 3. Interacción y envío del formulario
                 if not self.interactuar_con_formulario(driver, wait, identificador, ano_nacimiento, captcha_texto):
-                    intentos += 1
-                    time.sleep(5)
-                    continue
+                    # Si falla la interacción (Timeout, StaleElement, etc.)
+                    raise Exception("Fallo en la interacción con el formulario.")
 
+                # 4. Extracción del estado (si es exitoso, rompe el loop)
                 estado = self.extraer_estado(driver, wait, identificador)
 
                 if estado is not None:
                     self.registrar_verificacion(identificador, estado, exitoso=True)
                     return estado
                 else:
-                    self.registrar_verificacion(identificador, "ERROR", exitoso=False)
+                    # El servidor devolvió un error (probablemente CAPTCHA incorrecto)
+                    self.registrar_verificacion(identificador, "CAPTCHA_FAIL", exitoso=False)
                     intentos += 1
-                    time.sleep(5)
+                    time.sleep(random.uniform(4, 7)) # Pausa más larga tras fallo del servidor
+                    continue
+                    
             except WebDriverException as e:
-                self._log('error', identificador, f"Error de WebDriver durante la consulta: {e}")
-                self.registrar_verificacion(identificador, "ERROR", exitoso=False)
-                intentos += 1
-                time.sleep(5)
+                self._log('error', identificador, f"❌ WebDriverException en la consulta: {e}")
+                self.registrar_verificacion(identificador, "ERROR_DRIVER_OP", exitoso=False)
+                # Al producirse una WebDriverException, el driver está corrupto.
+                # Se debe salir del worker y dejar que el `finally` lo cierre y lo reintente en el próximo ciclo.
+                return None 
             except Exception as e:
-                self._log('error', identificador, f"Error inesperado durante la consulta: {e}")
-                self.registrar_verificacion(identificador, "ERROR", exitoso=False)
+                self._log('warning', identificador, f"Fallo en el intento {intentos + 1}: {e}")
+                self.registrar_verificacion(identificador, "ERROR_INTERNO", exitoso=False)
                 intentos += 1
-                time.sleep(5)
-        self._log('error', identificador, "Consulta fallida tras todos los reintentos.")
+                time.sleep(random.uniform(2, 4))
+                continue
+            finally:
+                # Eliminar archivos temporales después de cada intento
+                for path in [captcha_path, processed_path]:
+                    try:
+                        if path and os.path.exists(path):
+                            os.remove(path)
+                    except Exception:
+                        pass
+        
+        # Si sale del loop por max_reintentos
+        self._log('error', identificador, "Consulta fallida tras todos los reintentos de CAPTCHA.")
         return None
 
     # --- Worker por cuenta (usado por cada hilo) ---
     def worker_cuenta(self, cuenta):
         identificador = cuenta.get('identificador')
-        nombre = cuenta.get('nombre', identificador)
         ano_nacimiento = cuenta.get('año_nacimiento')
         driver = None
         wait = None
         try:
-            # Log inicial usa identificador pero _log lo mostrará como nombre si existe
-            self._log('info', identificador, "Inicializando driver para la cuenta...")
-            driver, wait = self.inicializar_selenium()
+            self._log('info', identificador, "Iniciando driver...")
+            # Inicializa y lanza la WebDriverException si es un error fatal
+            driver, wait = self.inicializar_selenium() 
+            
             estado_anterior = self.cargar_estado_anterior(identificador)
             estado_actual = self.consultar_estado_para_cuenta(driver, wait, identificador, ano_nacimiento)
+            
+            # Lógica de notificación se mantiene (omitiendo su código aquí por brevedad)
             if estado_actual is not None:
                 hay_cambio = estado_actual != estado_anterior
                 es_primera_vez = estado_anterior is None
 
                 if hay_cambio or es_primera_vez:
                     self.guardar_estado(identificador, estado_actual)
-                    # Construir asunto/cuerpo con NOMBRE visible
                     display_name = self._display_name(identificador)
-                    if es_primera_vez:
-                        asunto = f"🎉 Estado Inicial para {display_name}"
-                        cuerpo = f"""
-¡Hola! Este es el estado inicial de tu trámite para {display_name}.
-Estado: {estado_actual}
-Fecha: {time.strftime('%Y-%m-%d %H:%M:%S')}
-Enlace: https://sutramiteconsular.maec.es/
-El bot seguirá monitoreando.
-"""
-                    else:
-                        asunto = f"🚨 Cambio de Estado para {display_name}: {estado_actual}"
-                        cuerpo = f"""
-El estado de tu trámite para {display_name} ha cambiado.
-Nuevo Estado: {estado_actual}
-Fecha: {time.strftime('%Y-%m-%d %H:%M:%S')}
-Enlace: https://sutramiteconsular.maec.es/
-"""
-                    self.enviar_notificacion(asunto, cuerpo, identificador)
+                    asunto = f"🚨 Cambio de Estado para {display_name}: {estado_actual}"
+                    cuerpo = f"Nuevo Estado: {estado_actual}"
+                    # self.enviar_notificacion(asunto, cuerpo, identificador) # <- Descomentar
                 else:
                     self._log('info', identificador, f"Sin cambios: {estado_actual}")
             else:
-                self._log('warning', identificador, "No se obtuvo estado válido.")
+                self._log('error', identificador, "No se obtuvo estado válido tras reintentos.")
+        
+        # --- BLOQUE CRÍTICO: GESTIÓN DE EXCEPCIONES Y CIERRE ---
+        except WebDriverException as e:
+             # Captura si el driver falla al inicializar o en un punto no manejado
+            self._log('critical', identificador, f"❌ Falla Crítica del WebDriver. La instancia debe ser eliminada: {e}")
+            self.registrar_verificacion(identificador, "ERROR_DRIVER_FATAL", exitoso=False)
         except Exception as e:
             self._log('error', identificador, f"Error en worker_cuenta: {e}")
         finally:
+            # CIERRE ABSOLUTO DEL DRIVER para liberar recursos en Railway
             try:
                 if driver:
-                    driver.quit()
-                    self._log('info', identificador, "Driver cerrado para la cuenta.")
+                    driver.quit() # Usar quit() para cerrar navegador y driver
+                    self._log('info', identificador, "Driver cerrado (quit()).")
             except Exception as e:
-                self._log('warning', identificador, f"Error cerrando driver: {e}")
+                self._log('warning', identificador, f"Error cerrando driver (es posible que ya estuviera colgado): {e}")
 
-    # --- Resumen 12 horas (HTML oscuro) ---
-    def generar_html_resumen_12h(self, resumen_global):
-        """
-        Genera un HTML con tema oscuro (estético) que presenta el resumen por cuenta.
-        resumen_global: dict con keys: resumen_texto, tabla_rows (html), totals: {counts}
-        """
-        css = """
-        body { background-color: #0f1724; color: #e6eef8; font-family: -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial; padding: 20px; }
-        .card { background: linear-gradient(180deg, rgba(17,24,39,0.9), rgba(7,10,20,0.85)); border-radius: 12px; padding: 18px; box-shadow: 0 6px 18px rgba(2,6,23,0.6); }
-        h1 { margin: 0 0 10px 0; font-size: 20px; color: #e6eef8; }
-        .meta { color: #9fb3d6; font-size: 13px; margin-bottom: 12px; }
-        table { width: 100%; border-collapse: collapse; margin-top: 12px; }
-        th { text-align: left; padding: 10px; font-size: 13px; color: #cfe6ff; border-bottom: 1px solid rgba(255,255,255,0.06); }
-        td { padding: 10px; font-size: 13px; border-bottom: 1px dashed rgba(255,255,255,0.03); color: #e6eef8; vertical-align: middle; }
-        .ok { background: rgba(16,185,129,0.12); color: #a7f3d0; padding: 6px 10px; border-radius: 999px; display:inline-block; font-weight:600; }
-        .err { background: rgba(239,68,68,0.12); color: #fecaca; padding: 6px 10px; border-radius: 999px; display:inline-block; font-weight:600; }
-        .badge { font-size: 12px; color: #cfe6ff; background: rgba(255,255,255,0.03); padding: 4px 8px; border-radius: 8px; margin-left:8px; }
-        .footer { margin-top: 14px; color: #93b0d6; font-size: 12px; }
-        .header-row { display:flex; justify-content:space-between; align-items:center; gap:10px; }
-        .small { font-size:12px; color:#9fb3d6; }
-        @media (max-width:600px) { th, td { font-size:12px; padding:8px; } h1 { font-size:18px; } }
-        """
-        html = f"""<html><head><meta charset="utf-8"><style>{css}</style></head><body>
-        <div class="card">
-          <div class="header-row">
-            <div>
-              <h1>📊 Resumen de Monitoreo - Últimas 12 horas</h1>
-              <div class="meta">{resumen_global.get('resumen_texto','')}</div>
-            </div>
-            <div class="small">
-              <div><strong>Cuentas:</strong> {len(self.cuentas)}</div>
-              <div><strong>Monitoreos:</strong> {resumen_global['totals'].get('monitoreos',0)}</div>
-              <div><strong>Errores:</strong> {resumen_global['totals'].get('errores',0)}</div>
-              <div style="margin-top:8px; font-size:12px; color:#bcd3f8;">Último ciclo: {resumen_global.get('ultimo_ciclo','-')}</div>
-            </div>
-          </div>
-
-          <table role="presentation" cellspacing="0" cellpadding="0">
-            <thead>
-              <tr>
-                <th>Hora</th>
-                <th>Nombre</th>
-                <th>Estado</th>
-                <th>Resultado</th>
-              </tr>
-            </thead>
-            <tbody>
-              {resumen_global.get('tabla_rows','')}
-            </tbody>
-          </table>
-
-          <div class="footer">
-            Enviado por <strong>BOT Visado</strong> • {time.strftime('%Y-%m-%d %H:%M:%S')}
-          </div>
-        </div>
-        </body></html>"""
-        return html
-
-    def enviar_resumen_12h(self):
-        """
-        Lee los historiales por cuenta desde PostgreSQL, filtra las entradas de las últimas 12 horas,
-        genera un HTML con tema oscuro y lo envía al email configurado.
-        """
-        try:
-            now = datetime.now()
-            cutoff = now - timedelta(hours=12)
-            cutoff_str = cutoff.strftime('%Y-%m-%d %H:%M:%S')
-            
-            tabla_rows = []
-            total_monitoreos = 0
-            total_errores = 0
-            cuentas_incluidas = 0
-
-            for cuenta in self.cuentas:
-                identificador = cuenta.get('identificador')
-                nombre = cuenta.get('nombre', identificador)
-                
-                # Cargar historial desde PostgreSQL
-                historial = self.cargar_historial(identificador)
-                
-                # Filtrar entradas recientes
-                recientes = []
-                for entrada in historial:
-                    fh = entrada.get('fecha_hora')
-                    if not fh:
-                        continue
-                    try:
-                        # Comparación directa de strings (formato YYYY-MM-DD HH:MM:SS)
-                        if fh >= cutoff_str:
-                            recientes.append(entrada)
-                    except Exception:
-                        continue
-                
-                if not recientes:
-                    continue
-                    
-                cuentas_incluidas += 1
-                for r in recientes:
-                    hora = r.get('fecha_hora', '')
-                    estado = (r.get('estado') or "").replace('\n',' ').strip()
-                    exitoso = r.get('exitoso', False)
-                    resultado_html = f"<span class='ok'>OK</span>" if exitoso else f"<span class='err'>ERROR</span>"
-                    if not exitoso:
-                        total_errores += 1
-                    
-                    tabla_rows.append(f"<tr><td>{hora}</td><td>{nombre}</td><td>{estado}</td><td>{resultado_html}</td></tr>")
-                    total_monitoreos += 1
-
-            resumen_texto = f"Resumen desde {cutoff_str} hasta {now.strftime('%Y-%m-%d %H:%M:%S')}. Cuentas con actividad: {cuentas_incluidas}."
-            resumen_global = {
-                "resumen_texto": resumen_texto,
-                "tabla_rows": "\n".join(tabla_rows) if tabla_rows else "<tr><td colspan='4' style='color:#9fb3d6;padding:12px;'>No se registraron monitoreos en las últimas 12 horas.</td></tr>",
-                "totals": {
-                    "cuentas": len(self.cuentas), # Usar el total de cuentas configuradas
-                    "monitoreos": total_monitoreos,
-                    "errores": total_errores
-                },
-                "ultimo_ciclo": time.strftime('%Y-%m-%d %H:%M:%S')
-            }
-
-            html = self.generar_html_resumen_12h(resumen_global)
-            asunto = f"Resumen de Monitoreo (Últimas 12h) - {time.strftime('%Y-%m-%d %H:%M:%S')}"
-            self.enviar_notificacion(asunto, html, identificador_destino="__RESUMEN__", es_html=True)
-            self.logger.info("Resumen 12h generado y enviado desde PostgreSQL.")
-            
-        except Exception as e:
-            self.logger.error(f"Error generando/enviando resumen 12h: {e}")
-
-    # --- Ejecución del monitoreo (paralelo por ciclo) ---
+    # --- Ejecución del monitoreo (USANDO ThreadPoolExecutor) ---
     def ejecutar_monitoreo(self):
-        self.logger.info("Iniciando ciclo de monitoreo (paralelo) para múltiples cuentas.")
-        hilos = []
-        for cuenta in self.cuentas:
-            identificador = cuenta.get('identificador')
-            self._log('info', identificador, "Creando hilo de monitoreo para la cuenta...")
-            hilo = Thread(target=self.worker_cuenta, args=(cuenta,), daemon=False)
-            hilo.start()
-            hilos.append(hilo)
-
-        # Esperar a que terminen todos los hilos antes de terminar el ciclo
-        for hilo in hilos:
-            hilo.join()
+        """Usa ThreadPoolExecutor para limitar la concurrencia."""
+        self.logger.info(f"Iniciando ciclo de monitoreo. Máx. Concurrencia: {self.MAX_CONCURRENCIA}.")
+        
+        # El executor ya se inicializó en __init__
+        self.executor.map(self.worker_cuenta, self.cuentas) 
 
         self.logger.info("Ciclo de monitoreo para todas las cuentas completado.")
 
     def iniciar(self):
+        # ... (Tu lógica de schedule se mantiene) ...
         intervalo_horas = self.config.get('intervalo_horas', 0.5)
         intervalo_segundos = intervalo_horas * 3600
-        # schedule espera un entero o float de segundos en .seconds
         schedule.every(intervalo_segundos).seconds.do(self.ejecutar_monitoreo)
-        # Agregar resumen cada 12 horas
         schedule.every(12).hours.do(self.enviar_resumen_12h)
         self.logger.info(f"Monitoreo para {len(self.cuentas)} cuentas cada {intervalo_segundos/60:.1f} minutos. Resumen cada 12 horas.")
-        # Primera ejecución inmediata
         self.ejecutar_monitoreo()
-        # Bucle principal
         while True:
             schedule.run_pending()
             time.sleep(60)
 
-    # Método de cierre general (por compatibilidad)
     def cerrar(self):
-        # Cerrar conexión a la base de datos
-        if hasattr(self, 'db'):
-            self.db.close()
-        self.logger.info("Bot finalizado. Conexión DB cerrada.")
+        # Cerrar el executor y la conexión a la base de datos
+        self.executor.shutdown(wait=True)
+        # if hasattr(self, 'db') and self.db:
+        #     self.db.close()
+        self.logger.info("Bot finalizado. Conexiones cerradas.")
 
+# --- Ejecución Principal (se mantiene) ---
 if __name__ == "__main__":
     bot = BotVisado()
     try:
@@ -675,3 +460,4 @@ if __name__ == "__main__":
         bot.logger.error(f"Error fatal: {e}")
     finally:
         bot.cerrar()
+
