@@ -1,4 +1,4 @@
-config.yaml
+# .gitignore CORREGIDO
 *.log
 __pycache__/
 *.pyc
