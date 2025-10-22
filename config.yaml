@@ -4,7 +4,7 @@ resumen_interval_hours: 1  # Resumen cada 12 horas
 notificaciones:
   email_origen: "conabinotificaciones@gmail.com"
   app_password: "jzctkhlbxtmchlig"
-  email_destinos:
+  email_destino:
     - "edua56621636@gmail.com"
 
 cuentas:
@@ -17,6 +17,7 @@ cuentas:
     identificador: "ESP326CUDB42108243467929"
     año_nacimiento: "2006"
     email_notif: "edua56621636@gmail.com"
+
 
 
 
