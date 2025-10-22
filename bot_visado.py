@@ -9,6 +9,7 @@ import yaml
 import logging
 import tempfile
 import random
+import schedule
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor
 
@@ -76,8 +77,9 @@ class BotVisado:
         self.OCR_MIN_LEN = ocr_conf.get('min_length', 6)
         self.MAX_REINTENTOS = self.config.get('max_reintentos', 15)
 
-        # Resumen scheduling (usar schedule en iniciar)
+        # Resumen scheduling
         self.resumen_interval_hours = self.config.get('resumen_interval_hours', 12)
+        self.monitoreo_interval_hours = self.config.get('intervalo_horas', 0.5)
 
     # ---------- Config / Logging ----------
     def _cargar_config(self, path):
@@ -211,24 +213,7 @@ class BotVisado:
             self._log('error', identificador, f"Error al capturar CAPTCHA: {e}")
             return None
 
-    def preprocesar_v1(self, image_path, identificador=None):
-        """Preprocesado agresivo (x5, contraste fuerte, umbral 180)"""
-        try:
-            image = Image.open(image_path)
-            image = image.resize((image.width*5, image.height*5), Image.LANCZOS)
-            image = image.convert('L')
-            image = ImageEnhance.Contrast(image).enhance(5.0)
-            image = image.point(lambda p: 255 if p > 180 else 0)
-            image = image.filter(ImageFilter.MedianFilter(size=3))
-            out = image_path.replace('.png', '_procA.png')
-            image.save(out)
-            self._log('debug', identificador, f"Preproc v1 guardado: {out}")
-            return out
-        except Exception as e:
-            self._log('error', identificador, f"Error preproc v1: {e}")
-            return image_path
-
-    def preprocesar_v2(self, image_path, identificador=None):
+    def preprocesar_imagen(self, image_path, identificador=None):
         """Preprocesado estándar (x4, contraste 4, umbral 150)"""
         try:
             image = Image.open(image_path)
@@ -237,52 +222,43 @@ class BotVisado:
             image = ImageEnhance.Contrast(image).enhance(4.0)
             image = image.point(lambda p: 255 if p > 150 else 0)
             image = image.filter(ImageFilter.MedianFilter(size=3))
-            out = image_path.replace('.png', '_procB.png')
+            out = image_path.replace('.png', '_proc.png')
             image.save(out)
-            self._log('debug', identificador, f"Preproc v2 guardado: {out}")
+            self._log('debug', identificador, f"Imagen preprocesada guardada: {out}")
             return out
         except Exception as e:
-            self._log('error', identificador, f"Error preproc v2: {e}")
+            self._log('error', identificador, f"Error preprocesando imagen: {e}")
             return image_path
 
     def resolver_captcha(self, image_path, identificador=None):
         """
-        Intentará OCR sobre dos versiones (agresiva y estándar).
+        Intenta OCR sobre la imagen preprocesada.
         Devuelve el mejor resultado que cumpla la longitud mínima.
         """
         try:
-            candidates = []
-            # Pasada agresiva
-            p1 = self.preprocesar_v1(image_path, identificador)
-            if p1:
-                candidates.append(p1)
-            # Pasada estándar
-            p2 = self.preprocesar_v2(image_path, identificador)
-            if p2 and p2 != p1:
-                candidates.append(p2)
-
-            # Intentar OCR en cada candidate, valorando la 'mejor' cadena (más dígitos y longitud esperada)
+            # Preprocesar imagen
+            processed_path = self.preprocesar_imagen(image_path, identificador)
+            
             best = ""
             best_score = -1
-            for c in candidates:
-                try:
-                    img = Image.open(c)
-                    custom_config = f'--oem {self.OCR_OEM} --psm {self.OCR_PSM} -c tessedit_char_whitelist={self.OCR_WHITELIST}'
-                    raw = pytesseract.image_to_string(img, config=custom_config).strip()
-                    cleaned = ''.join(ch for ch in raw if ch.isdigit())
-                    score = len(cleaned)
-                    self._log('debug', identificador, f"OCR raw: '{raw}' -> cleaned: '{cleaned}' (score {score})")
-                    # Preferimos longitudes exactas, luego mayor longitud
-                    if score > best_score:
-                        best = cleaned
-                        best_score = score
-                except Exception as e:
-                    self._log('warning', identificador, f"OCR fallo en candidate {c}: {e}")
-                    continue
+            
+            try:
+                img = Image.open(processed_path)
+                custom_config = f'--oem {self.OCR_OEM} --psm {self.OCR_PSM} -c tessedit_char_whitelist={self.OCR_WHITELIST}'
+                raw = pytesseract.image_to_string(img, config=custom_config).strip()
+                cleaned = ''.join(ch for ch in raw if ch.isdigit())
+                score = len(cleaned)
+                self._log('debug', identificador, f"OCR raw: '{raw}' -> cleaned: '{cleaned}' (score {score})")
+                
+                if score > best_score:
+                    best = cleaned
+                    best_score = score
+            except Exception as e:
+                self._log('warning', identificador, f"OCR fallo en imagen procesada: {e}")
 
             # Validación final
             if best and len(best) >= self.OCR_MIN_LEN:
-                # Si viene más largo (ej: >6), truncar a la izquierda/ derecha según config
+                # Si viene más largo (ej: >6), truncar a la longitud mínima
                 texto_final = best[:self.OCR_MIN_LEN]
                 self._log('info', identificador, f"OCR validado: '{texto_final}' (original {best})")
                 return texto_final
@@ -587,45 +563,34 @@ class BotVisado:
     def iniciar(self):
         """
         Ejecuta un ciclo inmediato, luego entra en bucle programado.
-        Notar: no importo schedule aquí por simplicidad del ejemplo:
-        - Para producción, importa schedule y programa ejecutar_monitoreo cada intervalo, y enviar_resumen_12h cada self.resumen_interval_hours.
         """
-        intervalo_horas = self.config.get('intervalo_horas', 0.5)
-        intervalo_seg = intervalo_horas * 3600
-        self.logger.info(f"Monitoreo {len(self.cuentas)} cuentas cada {intervalo_horas} horas. Resumen cada {self.resumen_interval_hours} horas.")
-        # Primera ejecución
-        try:
-            self.ejecutar_monitoreo()
-            # Para producción deberías usar schedule.every(...) como en tus archivos originales.
-            # Aquí dejamos el programador simple: bucle infinito con sleep.
-            while True:
-                time.sleep(intervalo_seg)
-                self.ejecutar_monitoreo()
-                # Enviar resumen en intervalos
-                # Guardamos una marca simple en archivo para no depender de schedule
-                last_resumen_path = ".last_resumen"
-                now = time.time()
-                if os.path.exists(last_resumen_path):
-                    try:
-                        with open(last_resumen_path, 'r') as f:
-                            last = float(f.read().strip() or "0")
-                    except:
-                        last = 0.0
-                else:
-                    last = 0.0
-                if now - last >= self.resumen_interval_hours * 3600:
-                    self.enviar_resumen_12h()
-                    try:
-                        with open(last_resumen_path, 'w') as f:
-                            f.write(str(now))
-                    except:
-                        pass
-        except KeyboardInterrupt:
-            self.logger.info("Interrupción por teclado.")
-        except Exception as e:
-            self.logger.error(f"Error fatal en iniciar: {e}")
-        finally:
-            self.cerrar()
+        self.logger.info(f"Monitoreo {len(self.cuentas)} cuentas cada {self.monitoreo_interval_hours} horas. Resumen cada {self.resumen_interval_hours} horas.")
+        
+        # Programar tareas
+        schedule.every(self.monitoreo_interval_hours).hours.do(self.ejecutar_monitoreo)
+        schedule.every(self.resumen_interval_hours).hours.do(self.enviar_resumen_12h)
+        
+        # Ejecución inmediata
+        self.logger.info("Ejecutando primer monitoreo inmediato...")
+        self.ejecutar_monitoreo()
+        
+        self.logger.info("Enviando primer resumen inmediato...")
+        self.enviar_resumen_12h()
+        
+        self.logger.info(f"Programando monitoreo cada {self.monitoreo_interval_hours} horas...")
+        self.logger.info(f"Programando resumen cada {self.resumen_interval_hours} horas...")
+        
+        # Bucle principal
+        while True:
+            try:
+                schedule.run_pending()
+                time.sleep(60)  # Verificar cada minuto
+            except KeyboardInterrupt:
+                self.logger.info("Interrupción por teclado.")
+                break
+            except Exception as e:
+                self.logger.error(f"Error en bucle principal: {e}")
+                time.sleep(60)
 
     def cerrar(self):
         try:
@@ -642,7 +607,14 @@ class BotVisado:
 # ------------------ Ejecución principal ------------------
 if __name__ == "__main__":
     bot = BotVisado()
-    bot.iniciar()
+    try:
+        bot.iniciar()
+    except KeyboardInterrupt:
+        bot.cerrar()
+    except Exception as e:
+        bot.logger.error(f"Error fatal: {e}")
+        bot.cerrar()
+
 
 
 
