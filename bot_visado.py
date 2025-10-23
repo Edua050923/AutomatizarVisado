@@ -47,7 +47,7 @@ class BotVisado:
         self.db = None
         if HAS_DB and self.config.get('postgres', {}).get('enabled', False):
             try:
-                self.db = DatabaseManager(self.config.get('postgres', {}))
+                self.db = DatabaseManager()
                 self.logger.info("Conexión a PostgreSQL establecida.")
             except Exception as e:
                 self.logger.error(f"No se pudo conectar a PostgreSQL: {e}")
@@ -613,6 +613,7 @@ if __name__ == "__main__":
     except Exception as e:
         bot.logger.error(f"Error fatal: {e}")
         bot.cerrar()
+
 
 
 
