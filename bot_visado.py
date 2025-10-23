@@ -1,6 +1,5 @@
 # bot_visado_unificado.py
 # Fusionado: persistencia (Postgres) + Resend + OCR robusto + Selenium optimizado para Railway
-# Basado en: bot_visado_final.py + bot_visado.py (archivos del usuario).
 
 import os
 import time
@@ -457,7 +456,7 @@ class BotVisado:
             headers = {"Authorization": f"Bearer {resend_api_key}", "Content-Type": "application/json"}
             payload = {
                 "from": "BOT Visado <onboarding@resend.dev>",
-                "to": [email_dest],
+                "to": email_dest,  # CORREGIDO: string en lugar de lista
                 "subject": asunto,
                 "html": cuerpo if es_html else f"<pre style='font-family: Arial, sans-serif; white-space: pre-wrap;'>{cuerpo}</pre>"
             }
@@ -614,6 +613,7 @@ if __name__ == "__main__":
     except Exception as e:
         bot.logger.error(f"Error fatal: {e}")
         bot.cerrar()
+
 
 
 
