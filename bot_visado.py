@@ -47,7 +47,7 @@ class BotVisado:
         self.db = None
         if HAS_DB and self.config.get('postgres', {}).get('enabled', False):
             try:
-                self.db = DatabaseManager()
+                self.db = DatabaseManager()  # SIN PARÁMETROS
                 self.logger.info("Conexión a PostgreSQL establecida.")
             except Exception as e:
                 self.logger.error(f"No se pudo conectar a PostgreSQL: {e}")
@@ -109,6 +109,7 @@ class BotVisado:
 
     # DB wrappers (si no hay DB, operan en modo simulado / archivos)
     def guardar_estado(self, identificador, estado):
+        """Guarda estado actual y también lo añade al historial"""
         if self.db:
             try:
                 self.db.guardar_estado(identificador, estado)
@@ -118,11 +119,18 @@ class BotVisado:
                 self._log('error', identificador, f"Error guardando en DB: {e}")
                 return False
         else:
-            # Simular: guardar en archivo local por identificador
+            # Modo simulado: guardar en archivo local Y en historial
             try:
+                # 1. Guardar estado actual
                 fname = f"estado_{identificador}.txt"
                 with open(fname, 'w', encoding='utf-8') as f:
                     f.write(f"{estado}\n{time.strftime('%Y-%m-%d %H:%M:%S')}")
+                
+                # 2. Añadir al historial
+                hist_file = f"historial_{identificador}.log"
+                with open(hist_file, 'a', encoding='utf-8') as f:
+                    f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')}|{estado}|True\n")
+                
                 self._log('info', identificador, f"Estado guardado localmente en {fname}")
                 return True
             except Exception as e:
@@ -149,14 +157,63 @@ class BotVisado:
                 return None
 
     def registrar_verificacion(self, identificador, estado, exitoso=True):
+        """Registrar nueva verificación en historial"""
         if self.db:
             try:
                 self.db.registrar_verificacion(identificador, estado, exitoso)
             except Exception as e:
                 self._log('error', identificador, f"Error registrando verificación en DB: {e}")
         else:
-            # guardamos en log o archivo sencillo
-            self._log('info', identificador, f"Registro (simulado) - estado: {estado} - exitoso: {exitoso}")
+            # En modo simulado, guardar en archivo de historial
+            try:
+                hist_file = f"historial_{identificador}.log"
+                with open(hist_file, 'a', encoding='utf-8') as f:
+                    f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')}|{estado}|{exitoso}\n")
+                self._log('info', identificador, f"Registro (simulado) - estado: {estado} - exitoso: {exitoso}")
+            except Exception as e:
+                self._log('error', identificador, f"Error guardando historial local: {e}")
+
+    def cargar_historial(self, identificador, limite_horas=None):
+        """Cargar historial desde archivo local (modo simulado)"""
+        historial = []
+        try:
+            hist_file = f"historial_{identificador}.log"
+            if not os.path.exists(hist_file):
+                return historial
+                
+            with open(hist_file, 'r', encoding='utf-8') as f:
+                lineas = f.readlines()
+                
+            for linea in lineas:
+                try:
+                    partes = linea.strip().split('|')
+                    if len(partes) >= 3:
+                        fecha_hora = partes[0]
+                        estado = partes[1]
+                        exitoso = partes[2].lower() == 'true'
+                        
+                        # Filtrar por límite de tiempo si se especifica
+                        if limite_horas:
+                            fecha_obj = datetime.strptime(fecha_hora, '%Y-%m-%d %H:%M:%S')
+                            limite_tiempo = datetime.now() - timedelta(hours=limite_horas)
+                            if fecha_obj < limite_tiempo:
+                                continue
+                        
+                        historial.append({
+                            'fecha_hora': fecha_hora,
+                            'estado': estado,
+                            'exitoso': exitoso
+                        })
+                except Exception as e:
+                    continue
+                    
+            # Ordenar por fecha (más reciente primero)
+            historial.sort(key=lambda x: x['fecha_hora'], reverse=True)
+            return historial
+            
+        except Exception as e:
+            self._log('error', identificador, f"Error cargando historial local: {e}")
+            return historial
 
     # ---------- Selenium inicialización ----------
     def inicializar_selenium(self):
@@ -347,7 +404,7 @@ class BotVisado:
 
                 captcha_text = self.resolver_captcha(captcha_path, identificador)
 
-                # limpiar ficheros temporales (dejamos los procesados por seguridad)
+                # limpiar ficheros temporales
                 try:
                     if os.path.exists(captcha_path):
                         os.remove(captcha_path)
@@ -355,32 +412,32 @@ class BotVisado:
                     pass
 
                 if not captcha_text:
-                    self.registrar_verificacion(identificador, "CAPTCHA_FAIL", exitoso=False)
+                    # NO registrar verificación individual - solo continuar
                     time.sleep(random.uniform(2,5))
                     continue
 
                 if not self.interactuar_con_formulario(driver, wait, identificador, ano_nacimiento, captcha_text):
-                    self.registrar_verificacion(identificador, "INTERACT_FAIL", exitoso=False)
+                    # NO registrar verificación individual - solo continuar
                     time.sleep(random.uniform(2,5))
                     continue
 
                 estado = self.extraer_estado(driver, wait, identificador)
                 if estado is not None:
-                    self.registrar_verificacion(identificador, estado, exitoso=True)
+                    # ÉXITO - retornar el estado obtenido
                     return estado
                 else:
-                    # Probablemente captcha fallido en servidor
-                    self.registrar_verificacion(identificador, "CAPTCHA_REJECTED", exitoso=False)
+                    # NO registrar verificación individual - solo continuar
                     time.sleep(random.uniform(3,6))
                     continue
 
             except WebDriverException as e:
                 self._log('critical', identificador, f"WebDriverException crítica: {e}")
-                self.registrar_verificacion(identificador, "ERROR_DRIVER", exitoso=False)
-                return None
+                # NO registrar verificación individual - solo continuar
+                time.sleep(random.uniform(2,5))
+                continue
             except Exception as e:
                 self._log('error', identificador, f"Error inesperado en intento: {e}")
-                self.registrar_verificacion(identificador, "ERROR_INTERNO", exitoso=False)
+                # NO registrar verificación individual - solo continuar
                 time.sleep(random.uniform(2,5))
                 continue
 
@@ -393,12 +450,17 @@ class BotVisado:
         ano_nacimiento = cuenta.get('año_nacimiento')
         driver = None
         wait = None
+        ciclo_exitoso = False
+        estado_actual = None
+        
         try:
             self._log('info', identificador, "Iniciando driver para cuenta...")
             driver, wait = self.inicializar_selenium()
             estado_anterior = self.cargar_estado_anterior(identificador)
             estado_actual = self.consultar_estado_para_cuenta(driver, wait, identificador, ano_nacimiento)
+            
             if estado_actual:
+                ciclo_exitoso = True
                 if estado_anterior is None or estado_actual != estado_anterior:
                     self.guardar_estado(identificador, estado_actual)
                     asunto = f"🚨 Cambio de estado: {self._display_name(identificador)}"
@@ -407,9 +469,12 @@ class BotVisado:
                 else:
                     self._log('info', identificador, f"Sin cambios: {estado_actual}")
             else:
-                self._log('warning', identificador, "No se obtuvo estado válido tras intentos.")
+                self._log('warning', identificador, "Ciclo de monitoreo FALLIDO: No se obtuvo estado válido tras todos los intentos.")
+                ciclo_exitoso = False
+                
         except Exception as e:
-            self._log('error', identificador, f"Error worker_cuenta: {e}")
+            self._log('error', identificador, f"Error en ciclo de monitoreo: {e}")
+            ciclo_exitoso = False
         finally:
             try:
                 if driver:
@@ -417,6 +482,12 @@ class BotVisado:
                     self._log('info', identificador, "Driver cerrado.")
             except Exception as e:
                 self._log('warning', identificador, f"Error cerrando driver: {e}")
+        
+        # Registrar el resultado del CICLO COMPLETO (no intentos individuales)
+        if ciclo_exitoso:
+            self.registrar_verificacion(identificador, estado_actual, exitoso=True)
+        else:
+            self.registrar_verificacion(identificador, "CICLO_FALLIDO - No se pudo obtener estado", exitoso=False)
 
     def ejecutar_monitoreo(self):
         self.logger.info(f"Iniciando ciclo de monitoreo (concurrencia {self.MAX_CONCURRENCIA}).")
@@ -490,7 +561,7 @@ class BotVisado:
           <h1>📊 Resumen de Monitoreo - Últimas {self.resumen_interval_hours} horas</h1>
           <div class="meta">{resumen_global.get('resumen_texto','')}</div>
           <table role="presentation" cellspacing="0" cellpadding="0">
-            <thead><tr><th>Hora</th><th>Nombre</th><th>Estado</th><th>Resultado</th></tr></thead>
+            <thead><tr><th>Hora</th><th>Nombre</th><th>Estado</th><th>Resultado Ciclo</th></tr></thead>
             <tbody>{resumen_global.get('tabla_rows','')}</tbody>
           </table>
           <div class="footer">Enviado por <strong>BOT Visado</strong> • {time.strftime('%Y-%m-%d %H:%M:%S')}</div>
@@ -504,13 +575,15 @@ class BotVisado:
             cutoff_str = cutoff.strftime('%Y-%m-%d %H:%M:%S')
 
             tabla_rows = []
-            total_mon = 0
-            total_err = 0
-            cuentas_incl = 0
+            total_ciclos = 0
+            total_exitosos = 0
+            total_fallidos = 0
 
             for c in self.cuentas:
                 ident = c.get('identificador')
                 nombre = c.get('nombre', ident)
+                
+                # Cargar historial de ciclos (no intentos individuales)
                 historial = []
                 if self.db:
                     try:
@@ -518,43 +591,54 @@ class BotVisado:
                     except Exception as e:
                         self._log('warning', ident, f"Error cargando historial DB: {e}")
                 else:
-                    # Si no hay DB intentamos abrir archivo histórico sencillo (si se guarda)
-                    historial = []
+                    # Modo simulado - cargar desde archivo
+                    historial = self.cargar_historial(ident, self.resumen_interval_hours)
 
-                recientes = []
+                # Filtrar solo los ciclos del período
+                ciclos_recientes = []
                 for e in historial:
                     fh = e.get('fecha_hora')
                     if not fh:
                         continue
                     try:
                         if fh >= cutoff_str:
-                            recientes.append(e)
+                            ciclos_recientes.append(e)
                     except Exception:
                         continue
 
-                if not recientes:
+                if not ciclos_recientes:
                     continue
-                cuentas_incl += 1
-                for r in recientes:
-                    hora = r.get('fecha_hora', '')
-                    estado = (r.get('estado') or "").replace('\n',' ').strip()
-                    exitoso = r.get('exitoso', False)
-                    resultado_html = "<span class='ok'>OK</span>" if exitoso else "<span class='err'>ERROR</span>"
-                    if not exitoso:
-                        total_err += 1
-                    tabla_rows.append(f"<tr><td>{hora}</td><td>{nombre}</td><td>{estado}</td><td>{resultado_html}</td></tr>")
-                    total_mon += 1
+                    
+                for ciclo in ciclos_recientes:
+                    total_ciclos += 1
+                    hora = ciclo.get('fecha_hora', '')
+                    estado = (ciclo.get('estado') or "").replace('\n',' ').strip()
+                    exitoso = ciclo.get('exitoso', False)
+                    
+                    if exitoso:
+                        total_exitosos += 1
+                        resultado_html = "<span class='ok'>ÉXITO</span>"
+                        estado_display = estado
+                    else:
+                        total_fallidos += 1
+                        resultado_html = "<span class='err'>FALLIDO</span>"
+                        estado_display = "No se pudo obtener estado - Ciclo fallido"
+                    
+                    tabla_rows.append(f"<tr><td>{hora}</td><td>{nombre}</td><td>{estado_display}</td><td>{resultado_html}</td></tr>")
 
-            resumen_texto = f"Resumen desde {cutoff_str} hasta {now.strftime('%Y-%m-%d %H:%M:%S')}. Cuentas con actividad: {cuentas_incl}"
+            resumen_texto = f"Resumen desde {cutoff_str} hasta {now.strftime('%Y-%m-%d %H:%M:%S')}. Total ciclos: {total_ciclos} - Exitosa: {total_exitosos} - Fallidas: {total_fallidos}"
+            
             resumen_global = {
                 "resumen_texto": resumen_texto,
-                "tabla_rows": "\n".join(tabla_rows) if tabla_rows else "<tr><td colspan='4' style='color:#9fb3d6;padding:12px;'>No se registraron monitoreos en el periodo.</td></tr>",
-                "totals": {"cuentas": cuentas_incl, "monitoreos": total_mon, "errores": total_err}
+                "tabla_rows": "\n".join(tabla_rows) if tabla_rows else "<tr><td colspan='4' style='color:#9fb3d6;padding:12px;'>No se registraron ciclos de monitoreo en el periodo.</td></tr>",
+                "totals": {"ciclos": total_ciclos, "exitosos": total_exitosos, "fallidos": total_fallidos}
             }
+            
             html = self.generar_html_resumen_12h(resumen_global)
             asunto = f"Resumen de Monitoreo (Últimas {self.resumen_interval_hours}h) - {time.strftime('%Y-%m-%d %H:%M:%S')}"
             self.enviar_notificacion(asunto, html, identificador_destino="__RESUMEN__", es_html=True)
-            self.logger.info("Resumen 12h generado/enviado.")
+            self.logger.info(f"Resumen 12h generado/enviado. Ciclos: {total_ciclos}, Exitosos: {total_exitosos}, Fallidos: {total_fallidos}")
+            
         except Exception as e:
             self.logger.error(f"Error generando resumen 12h: {e}")
 
