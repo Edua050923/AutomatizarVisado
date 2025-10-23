@@ -100,17 +100,30 @@ class DatabaseManager:
             self.logger.error(f"Error cargando estado desde DB: {e}")
             return None
     
-    def cargar_historial(self, identificador, limite=1000):
-        """Cargar historial de verificaciones"""
+    def cargar_historial(self, identificador, limite=1000, cutoff_time=None):
+        """
+        Cargar historial de verificaciones, 
+        opcionalmente filtrando desde una fecha/hora (cutoff_time)
+        """
         try:
             with self.conn.cursor() as cur:
-                cur.execute("""
+                query = """
                     SELECT fecha_hora, estado, exitoso 
                     FROM historial_verificaciones 
                     WHERE identificador = %s 
-                    ORDER BY fecha_hora DESC 
-                    LIMIT %s
-                """, (identificador, limite))
+                """
+                params = [identificador]
+                
+                if cutoff_time:
+                    # Filtramos por created_at, que es un TIMESTAMP real y eficiente
+                    query += " AND created_at >= %s " 
+                    params.append(cutoff_time)
+                
+                # Ordenamos por el TIMESTAMP real para asegurar el orden
+                query += " ORDER BY created_at DESC LIMIT %s"
+                params.append(limite)
+                
+                cur.execute(query, tuple(params))
                 return [dict(row) for row in cur.fetchall()]
         except Exception as e:
             self.logger.error(f"Error cargando historial desde DB: {e}")
