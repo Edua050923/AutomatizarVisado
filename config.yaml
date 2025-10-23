@@ -1,11 +1,8 @@
-# config.yaml
-intervalo_horas: 0.5  # Monitoreo cada 30 minutos
-resumen_interval_hours: 1  # Resumen cada 12 horas
+intervalo_horas: 0.5
+resumen_interval_hours: 1
+
 notificaciones:
-  email_origen: "conabinotificaciones@gmail.com"
-  app_password: "jzctkhlbxtmchlig"
-  email_destino:
-    - "edua56621636@gmail.com"
+  email_destino: "edua56621636@gmail.com"
 
 cuentas:
   - nombre: "Eduardo Pérez"
@@ -17,6 +14,9 @@ cuentas:
     identificador: "ESP326CUDB42108243467929"
     año_nacimiento: "2006"
     email_notif: "edua56621636@gmail.com"
+
+postgres:
+  enabled: true
 
 
 
