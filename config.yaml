@@ -1,5 +1,5 @@
 intervalo_horas: 0.5
-resumen_interval_hours: 1
+resumen_interval_hours: 12
 
 notificaciones:
   email_destino: "edua56621636@gmail.com"
@@ -17,6 +17,7 @@ cuentas:
 
 postgres:
   enabled: true
+
 
 
 
