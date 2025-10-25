@@ -38,7 +38,7 @@ except Exception:
 # ------------------ Clase unificada ------------------
 
 class BotVisado:
-    DEFAULT_MAX_CONCURRENCY = 4
+    DEFAULT_MAX_CONCURRENCY = 2  # REDUCIDO para Railway
 
     def __init__(self, config_path="config.yaml"):
         self.config = self._cargar_config(config_path)
@@ -64,7 +64,7 @@ class BotVisado:
             raise ValueError("No se encontraron cuentas en la configuración (config.yaml).")
         self.logger.info(f"Cuentas configuradas para monitoreo: {len(self.cuentas)}")
 
-        # Concurrencia
+        # Concurrencia REDUCIDA para Railway
         self.MAX_CONCURRENCIA = self.config.get('max_concurrency', self.DEFAULT_MAX_CONCURRENCY)
         self.executor = ThreadPoolExecutor(max_workers=self.MAX_CONCURRENCIA)
 
@@ -74,7 +74,7 @@ class BotVisado:
         self.OCR_OEM = ocr_conf.get('oem', 3)
         self.OCR_WHITELIST = ocr_conf.get('whitelist', '0123456789')
         self.OCR_MIN_LEN = ocr_conf.get('min_length', 6)
-        self.MAX_REINTENTOS = self.config.get('max_reintentos', 15)
+        self.MAX_REINTENTOS = self.config.get('max_reintentos', 10)  # Reducido
 
         # Resumen scheduling
         self.resumen_interval_hours = self.config.get('resumen_interval_hours', 12)
@@ -215,7 +215,7 @@ class BotVisado:
             self._log('error', identificador, f"Error cargando historial local: {e}")
             return historial
 
-    # ---------- Selenium inicialización ----------
+    # ---------- Selenium inicialización MEJORADA ----------
     def inicializar_selenium(self):
         try:
             options = webdriver.ChromeOptions()
@@ -226,23 +226,73 @@ class BotVisado:
             options.add_argument("--disable-extensions")
             options.add_argument("--disable-software-rasterizer")
             options.add_argument("--disable-blink-features=AutomationControlled")
+            
+            # SOLUCIONES CRÍTICAS PARA RAILWAY
+            options.add_argument("--disable-dev-shm-usage")
+            options.add_argument("--disable-web-security")
+            options.add_argument("--disable-features=VizDisplayCompositor")
+            options.add_argument("--disable-ipc-flooding-protection")
+            options.add_argument("--no-first-run")
+            options.add_argument("--no-default-browser-check")
+            options.add_argument("--disable-background-timer-throttling")
+            options.add_argument("--disable-renderer-backgrounding")
+            options.add_argument("--disable-backgrounding-occluded-windows")
+            
+            # Directorio temporal único para cada instancia
+            options.add_argument(f"--user-data-dir=/tmp/chrome-{int(time.time()*1000)}")
+            
+            # Limitar uso de recursos
+            options.add_argument("--memory-pressure-off")
+            options.add_argument("--max_old_space_size=512")
+            
             options.add_experimental_option("excludeSwitches", ["enable-automation"])
             options.add_experimental_option('useAutomationExtension', False)
-            options.add_argument("--window-size=1920,1080")
-            # Escala si la config pide render más claro
-            if self.config.get('force_device_scale', False):
-                options.add_argument("--force-device-scale-factor=2")
+            options.add_argument("--window-size=1280,720")  # Reducir resolución
+            
+            # Configuración adicional para estabilidad
+            options.add_argument("--disable-logging")
+            options.add_argument("--log-level=3")
+            options.add_argument("--silent")
+            
+            # Intentar obtener chromedriver de forma robusta
+            service = None
+            chromedriver_path = self.obtener_chromedriver_path()
+            if chromedriver_path:
+                service = webdriver.ChromeService(executable_path=chromedriver_path)
+                self.logger.info(f"Usando chromedriver en: {chromedriver_path}")
+            else:
+                service = webdriver.ChromeService()
+                self.logger.info("Usando Selenium Manager para chromedriver")
 
-            driver = webdriver.Chrome(options=options)
+            driver = webdriver.Chrome(options=options, service=service)
+            
             try:
                 driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
             except Exception:
                 pass
-            wait = WebDriverWait(driver, 20)
+            
+            wait = WebDriverWait(driver, 15)  # Reducir timeout
             return driver, wait
+            
         except Exception as e:
             self.logger.error(f"Error FATAL al inicializar Selenium: {e}")
             raise
+
+    def obtener_chromedriver_path(self):
+        """Intenta obtener chromedriver de múltiples fuentes"""
+        posibles_paths = [
+            "/usr/local/bin/chromedriver",
+            "/usr/bin/chromedriver", 
+            "./chromedriver",
+            os.path.expanduser("~/.cache/selenium/chromedriver/linux64/141.0.7390.122/chromedriver")
+        ]
+        
+        for path in posibles_paths:
+            if os.path.exists(path):
+                self.logger.info(f"Chromedriver encontrado en: {path}")
+                return path
+        self.logger.warning("Chromedriver no encontrado en rutas conocidas, usando Selenium Manager")
+        return None
 
     # ---------- CAPTCHA: captura + preprocesado + OCR ----------
     def capturar_captcha(self, driver, wait, identificador=None):
@@ -349,7 +399,7 @@ class BotVisado:
             captcha_input.send_keys(captcha_texto)
 
             # Pequeña pausa y click robusto
-            time.sleep(random.uniform(0.3, 1.0))
+            time.sleep(random.uniform(0.5, 1.5))
             try:
                 driver.execute_script("arguments[0].click();", submit_button)
             except Exception:
@@ -395,11 +445,11 @@ class BotVisado:
             self._log('info', identificador, f"Intento {intentos}/{self.MAX_REINTENTOS}")
             try:
                 driver.get("https://sutramiteconsular.maec.es/")
-                time.sleep(random.uniform(1.5, 3.5))
+                time.sleep(random.uniform(2, 4))  # Aumentado ligeramente
                 captcha_path = self.capturar_captcha(driver, wait, identificador)
                 if not captcha_path:
                     self._log('warning', identificador, "No se capturó captcha, reintentando.")
-                    time.sleep(random.uniform(2,5))
+                    time.sleep(random.uniform(3, 6))
                     continue
 
                 captcha_text = self.resolver_captcha(captcha_path, identificador)
@@ -408,17 +458,20 @@ class BotVisado:
                 try:
                     if os.path.exists(captcha_path):
                         os.remove(captcha_path)
+                    proc_path = captcha_path.replace('.png', '_proc.png')
+                    if os.path.exists(proc_path):
+                        os.remove(proc_path)
                 except:
                     pass
 
                 if not captcha_text:
                     # NO registrar verificación individual - solo continuar
-                    time.sleep(random.uniform(2,5))
+                    time.sleep(random.uniform(3, 6))
                     continue
 
                 if not self.interactuar_con_formulario(driver, wait, identificador, ano_nacimiento, captcha_text):
                     # NO registrar verificación individual - solo continuar
-                    time.sleep(random.uniform(2,5))
+                    time.sleep(random.uniform(3, 6))
                     continue
 
                 estado = self.extraer_estado(driver, wait, identificador)
@@ -427,25 +480,28 @@ class BotVisado:
                     return estado
                 else:
                     # NO registrar verificación individual - solo continuar
-                    time.sleep(random.uniform(3,6))
+                    time.sleep(random.uniform(4, 7))
                     continue
 
             except WebDriverException as e:
                 self._log('critical', identificador, f"WebDriverException crítica: {e}")
                 # NO registrar verificación individual - solo continuar
-                time.sleep(random.uniform(2,5))
+                time.sleep(random.uniform(3, 6))
                 continue
             except Exception as e:
                 self._log('error', identificador, f"Error inesperado en intento: {e}")
                 # NO registrar verificación individual - solo continuar
-                time.sleep(random.uniform(2,5))
+                time.sleep(random.uniform(3, 6))
                 continue
 
         self._log('error', identificador, "Falló tras todos los reintentos de CAPTCHA.")
         return None
 
-    # ---------- Worker y ejecución paralela ----------
+    # ---------- Worker y ejecución paralela MEJORADA ----------
     def worker_cuenta(self, cuenta):
+        # Delay inicial para distribuir carga
+        time.sleep(random.uniform(1, 5))
+        
         identificador = cuenta.get('identificador')
         ano_nacimiento = cuenta.get('año_nacimiento')
         driver = None
@@ -479,9 +535,13 @@ class BotVisado:
             try:
                 if driver:
                     driver.quit()
-                    self._log('info', identificador, "Driver cerrado.")
+                    self._log('info', identificador, "Driver cerrado correctamente.")
             except Exception as e:
                 self._log('warning', identificador, f"Error cerrando driver: {e}")
+            
+            # Limpieza adicional de recursos
+            import gc
+            gc.collect()
         
         # Registrar el resultado del CICLO COMPLETO (no intentos individuales)
         if ciclo_exitoso:
