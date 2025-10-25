@@ -1,0 +1,9 @@
+[build]
+builder = "nixpacks"
+
+[deploy]
+startCommand = "python bot_visado.py"
+
+[env]
+DISPLAY = ":99"
+CHROME_BIN = "/usr/bin/google-chrome"
