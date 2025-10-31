@@ -1,5 +1,0 @@
-# .gitignore CORREGIDO
-*.log
-__pycache__/
-*.pyc
-.env
